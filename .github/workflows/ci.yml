@@ -10,13 +10,13 @@ jobs:
     name: Build and test
     runs-on: macos-26
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
 
       - name: Install build tools
         run: brew install xcodegen
 
       - name: Cache the speech engine
-        uses: actions/cache@v4
+        uses: actions/cache@v6
         with:
           path: |
             vendor/transcribe.cpp
