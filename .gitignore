@@ -1,0 +1,19 @@
+# Build output
+build/
+Nabra.xcodeproj/
+.DS_Store
+
+# The speech engine is cloned and built by scripts/build-engine.sh
+vendor/transcribe.cpp/
+vendor/engine-dist/
+
+# Helper models are downloaded by scripts/fetch-resources.sh
+Nabra/Resources/*.gguf
+
+# Your own signing identity (see Config/Signing.xcconfig)
+Config/Signing.local.xcconfig
+
+# Evaluation audio and transcripts come from third-party datasets and are rebuilt locally
+eval/data/clips/
+eval/data/manifest.jsonl
+eval/results/

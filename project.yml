@@ -1,0 +1,68 @@
+name: Nabra
+options:
+  bundleIdPrefix: app.nabra
+  deploymentTarget:
+    macOS: "15.0"
+  createIntermediateGroups: true
+  generateEmptyDirectories: false
+settings:
+  base:
+    SWIFT_VERSION: "5.0"
+    MACOSX_DEPLOYMENT_TARGET: "15.0"
+    ARCHS: arm64
+    ONLY_ACTIVE_ARCH: YES
+    CLANG_ENABLE_OBJC_ARC: YES
+    ENABLE_USER_SCRIPT_SANDBOXING: NO
+    SWIFT_STRICT_CONCURRENCY: minimal
+targets:
+  Nabra:
+    type: application
+    platform: macOS
+    sources:
+      - path: Nabra
+        excludes:
+          - "Resources/Info.plist"
+    configFiles:
+      Debug: Config/Signing.xcconfig
+      Release: Config/Signing.xcconfig
+    settings:
+      base:
+        PRODUCT_BUNDLE_IDENTIFIER: app.nabra.Nabra
+        PRODUCT_NAME: Nabra
+        MARKETING_VERSION: "1.0"
+        CURRENT_PROJECT_VERSION: "1"
+        INFOPLIST_FILE: Nabra/Resources/Info.plist
+        GENERATE_INFOPLIST_FILE: NO
+        SWIFT_OBJC_BRIDGING_HEADER: Nabra/Support/Nabra-Bridging-Header.h
+        HEADER_SEARCH_PATHS: "$(SRCROOT)/vendor/engine-dist/include"
+        LIBRARY_SEARCH_PATHS: "$(SRCROOT)/vendor/engine-dist/lib"
+        OTHER_LDFLAGS: "-lc++"
+        ENABLE_HARDENED_RUNTIME: NO
+        ASSETCATALOG_COMPILER_APPICON_NAME: AppIcon
+        ASSETCATALOG_COMPILER_GLOBAL_ACCENT_COLOR_NAME: AccentColor
+        COMBINE_HIDPI_IMAGES: YES
+        DEAD_CODE_STRIPPING: YES
+        SWIFT_OPTIMIZATION_LEVEL: "-O"
+        GCC_OPTIMIZATION_LEVEL: "s"
+    dependencies:
+      # Listed as files (not -l flags) so Xcode relinks whenever the engine is rebuilt.
+      - framework: vendor/engine-dist/lib/libtranscribe.a
+        embed: false
+      - framework: vendor/engine-dist/lib/libggml.a
+        embed: false
+      - framework: vendor/engine-dist/lib/libggml-cpu.a
+        embed: false
+      - framework: vendor/engine-dist/lib/libggml-metal.a
+        embed: false
+      - framework: vendor/engine-dist/lib/libggml-base.a
+        embed: false
+      - sdk: Accelerate.framework
+      - sdk: Metal.framework
+      - sdk: MetalKit.framework
+      - sdk: Foundation.framework
+      - sdk: AVFoundation.framework
+      - sdk: CoreAudio.framework
+      - sdk: AudioToolbox.framework
+      - sdk: ApplicationServices.framework
+      - sdk: ServiceManagement.framework
+      - sdk: libsqlite3.tbd

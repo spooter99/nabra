@@ -1,0 +1,180 @@
+diff --git a/src/arch/cohere/decoder.cpp b/src/arch/cohere/decoder.cpp
+index 4ef7d11..5682f00 100644
+--- a/src/arch/cohere/decoder.cpp
++++ b/src/arch/cohere/decoder.cpp
+@@ -888,6 +888,11 @@ StepBuild build_step_graph(ggml_context *        ctx,
+         logits = ggml_add(ctx, logits, w.head.bias);
+     }
+ 
++    // [nabra] keep the logits readable after compute so the caller can derive a confidence
++    ggml_set_name(logits, "step.logits");
++    ggml_set_output(logits);
++    sb.logits_out = logits;
++
+     sb.argmax_out = ggml_argmax(ctx, logits);
+     ggml_set_name(sb.argmax_out, "step.argmax");
+     ggml_set_output(sb.argmax_out);
+diff --git a/src/arch/cohere/decoder.h b/src/arch/cohere/decoder.h
+index 05b7589..2557150 100644
+--- a/src/arch/cohere/decoder.h
++++ b/src/arch/cohere/decoder.h
+@@ -100,6 +100,7 @@ struct StepBuild {
+     ggml_tensor * kv_idx_in   = nullptr;  // i64 [1]
+     ggml_tensor * mask_in     = nullptr;  // f16 [max_n_kv, 1]
+     ggml_tensor * argmax_out  = nullptr;  // i32 [1]
++    ggml_tensor * logits_out  = nullptr;  // [nabra] f32 [vocab, 1], kept readable for confidence
+     int           max_n_kv    = 0;
+     ggml_cgraph * graph       = nullptr;
+ };
+diff --git a/src/arch/cohere/model.cpp b/src/arch/cohere/model.cpp
+index e7f9e05..114267b 100644
+--- a/src/arch/cohere/model.cpp
++++ b/src/arch/cohere/model.cpp
+@@ -27,6 +27,22 @@
+ #include "transcribe-repetition-guard.h"
+ #include "weights.h"
+ 
++// [nabra] Mean log-probability of the tokens chosen by the most recent single-utterance decode on
++// this thread (0 when nothing was decoded). Lets a caller compare two decodes of the same audio.
++static thread_local float g_nabra_cohere_avg_logprob = 0.0f;
++extern "C" float transcribe_cohere_last_avg_logprob(void) {
++    return g_nabra_cohere_avg_logprob;
++}
++
++// [nabra] When set, the next decode on this thread skips the mel + encoder stage and reuses the
++// encoder output left in the session by the previous run. The caller promises the audio is the
++// same; only the decoder prompt (language) differs. Used to decode one clip under two language
++// hints for the price of one encoder pass.
++static thread_local bool g_nabra_cohere_reuse_encoder = false;
++extern "C" void transcribe_cohere_set_reuse_encoder(bool reuse) {
++    g_nabra_cohere_reuse_encoder = reuse;
++}
++
+ #include <algorithm>
+ #include <cmath>
+ #include <cstdint>
+@@ -669,6 +685,46 @@ transcribe_status run(transcribe_session *          session,
+ 
+     transcribe::debug::init();
+ 
++    ggml_type resolved_kv = GGML_TYPE_COUNT;
++    if (cc->kv_type == TRANSCRIBE_KV_TYPE_F32) {
++        resolved_kv = GGML_TYPE_F32;
++    }
++    if (cc->kv_type == TRANSCRIBE_KV_TYPE_F16) {
++        resolved_kv = GGML_TYPE_F16;
++    }
++
++    // Dump helper (used by the encoder and decoder stages).
++    auto try_dump = [](const char * name, ggml_tensor * t, const char * stage) {
++        if (t != nullptr) {
++            transcribe::debug::dump_tensor(name, t, stage);
++        }
++    };
++
++    // [nabra] reuse the encoder output of the previous run on request
++    const bool nabra_reuse = g_nabra_cohere_reuse_encoder && !cc->enc_host.empty() &&
++                             cc->kv_cache.buffer != nullptr && cc->kv_cache.T_enc > 0;
++    int nabra_T_enc = 0;
++    if (nabra_reuse) {
++        nabra_T_enc     = cc->kv_cache.T_enc;
++        cc->t_mel_us    = 0;
++        cc->t_encode_us = 0;
++        // Same per-call state the encoder stage would have set up.
++        if (cc->compute_ctx != nullptr) {
++            ggml_free(cc->compute_ctx);
++            cc->compute_ctx = nullptr;
++        }
++        cc->encoder_out = nullptr;
++        if (cc->sched == nullptr) {
++            cc->sched = ggml_backend_sched_new(cm->plan.scheduler_list.data(), nullptr,
++                                               static_cast<int>(cm->plan.scheduler_list.size()), 16384, false, true);
++            if (cc->sched == nullptr) {
++                log_msg(TRANSCRIBE_LOG_LEVEL_ERROR, "cohere run: ggml_backend_sched_new failed");
++                return TRANSCRIBE_ERR_BACKEND;
++            }
++        }
++        transcribe::configure_sched_n_threads(cc->sched, cc->n_threads);
++    } else {
++
+     // ----- Mel front-end -------------------------------------------
+     if (!cm->mel.has_value()) {
+         log_msg(TRANSCRIBE_LOG_LEVEL_ERROR, "cohere run: model has no MelFrontend (load skipped?)");
+@@ -726,14 +782,6 @@ transcribe_status run(transcribe_session *          session,
+         }
+     }
+ 
+-    ggml_type resolved_kv = GGML_TYPE_COUNT;
+-    if (cc->kv_type == TRANSCRIBE_KV_TYPE_F32) {
+-        resolved_kv = GGML_TYPE_F32;
+-    }
+-    if (cc->kv_type == TRANSCRIBE_KV_TYPE_F16) {
+-        resolved_kv = GGML_TYPE_F16;
+-    }
+-
+     EncoderBuild eb = build_encoder_graph(cc->compute_ctx, cm->weights, cm->hparams, mel_n_frames, resolved_kv,
+                                           cc->encoder_use_flash, cm->backend.c_str());
+     if (eb.mel_in == nullptr || eb.out == nullptr || eb.graph == nullptr) {
+@@ -801,13 +849,6 @@ transcribe_status run(transcribe_session *          session,
+     }
+     cc->t_encode_us = ggml_time_us() - t_enc_start;
+ 
+-    // Dump encoder intermediates.
+-    auto try_dump = [](const char * name, ggml_tensor * t, const char * stage) {
+-        if (t != nullptr) {
+-            transcribe::debug::dump_tensor(name, t, stage);
+-        }
+-    };
+-
+     // Pre-encode sub-stage dumps for debugging.
+     try_dump("enc.pre_encode.out", eb.dumps.pre_encode_out, "encoder.pre_encode");
+     try_dump("enc.block.0.out", eb.dumps.block0_out, "encoder.block0.out");
+@@ -838,6 +879,10 @@ transcribe_status run(transcribe_session *          session,
+     }
+     cc->enc_host.resize(static_cast<size_t>(d_enc) * static_cast<size_t>(T_enc));
+     ggml_backend_tensor_get(eb.out, cc->enc_host.data(), 0, cc->enc_host.size() * sizeof(float));
++    nabra_T_enc = T_enc;
++
++    }  // [nabra] end of the mel + encoder stage
++    const int T_enc = nabra_T_enc;
+ 
+     // ----- Decoder with KV cache ------------------------------------
+     //
+@@ -1181,6 +1226,12 @@ transcribe_status run(transcribe_session *          session,
+                 step_mask[p] = mask_zero;
+             }
+ 
++            // [nabra] confidence accumulation
++            double             nabra_logprob_sum = 0.0;
++            int                nabra_logprob_n   = 0;
++            std::vector<float> nabra_logits;
++            g_nabra_cohere_avg_logprob = 0.0f;
++
+             for (int step = 1; step < max_tokens && next_token != eos_id; ++step) {
+                 if (cc->poll_abort()) {
+                     commit_result();
+@@ -1225,6 +1276,24 @@ transcribe_status run(transcribe_session *          session,
+                 ggml_backend_tensor_get(sb.argmax_out, &argmax_id, 0, sizeof(int32_t));
+                 next_token = argmax_id;
+ 
++                // [nabra] log-probability of the chosen token: logit - logsumexp(logits)
++                if (sb.logits_out != nullptr && next_token != eos_id) {
++                    const int64_t vocab = sb.logits_out->ne[0];
++                    if (vocab > 0 && argmax_id >= 0 && argmax_id < vocab) {
++                        nabra_logits.resize(static_cast<size_t>(vocab));
++                        ggml_backend_tensor_get(sb.logits_out, nabra_logits.data(), 0,
++                                                static_cast<size_t>(vocab) * sizeof(float));
++                        const float top = nabra_logits[argmax_id];
++                        double      sum = 0.0;
++                        for (int64_t j = 0; j < vocab; ++j) {
++                            sum += std::exp(static_cast<double>(nabra_logits[j] - top));
++                        }
++                        nabra_logprob_sum -= std::log(sum);
++                        nabra_logprob_n   += 1;
++                        g_nabra_cohere_avg_logprob = static_cast<float>(nabra_logprob_sum / nabra_logprob_n);
++                    }
++                }
++
+                 if (next_token != eos_id) {
+                     generated_ids.push_back(next_token);
+                     if (transcribe::stop_on_repetition(generated_ids, "cohere run")) {

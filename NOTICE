@@ -1,0 +1,18 @@
+Nabra
+Copyright 2026 The Nabra Authors
+
+Licensed under the Apache License, Version 2.0 (see LICENSE).
+
+Nabra builds on the work of others. Their code and models keep their own licences:
+
+- transcribe.cpp (https://github.com/handy-computer/transcribe.cpp), MIT. The speech engine.
+  Built from source with the small patch in vendor/patches.
+- ggml (https://github.com/ggml-org/ggml), MIT. Tensor library used by transcribe.cpp.
+- Cohere Transcribe Arabic 07-2026 (https://huggingface.co/CohereLabs/cohere-transcribe-arabic-07-2026),
+  Apache-2.0. The speech model, downloaded by the app on first run in the GGUF build published at
+  https://huggingface.co/handy-computer/cohere-transcribe-arabic-07-2026-gguf.
+- Silero VAD (https://github.com/snakers4/silero-vad), MIT. Finds speech in the recording.
+- VoxLingua107 ECAPA-TDNN language identification
+  (https://huggingface.co/speechbrain/lang-id-voxlingua107-ecapa), Apache-2.0.
+
+None of these projects endorse Nabra.

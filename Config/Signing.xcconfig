@@ -1,0 +1,18 @@
+// Code signing.
+//
+// The default is ad-hoc signing ("-"), which lets anyone build and run Nabra with no Apple account.
+// With ad-hoc signing macOS treats every rebuild as a new app and asks for the Microphone and
+// Accessibility permissions again. To keep them across rebuilds, sign with a stable identity:
+// create Config/Signing.local.xcconfig (ignored by git) containing, for example,
+//
+//   CODE_SIGN_IDENTITY = Apple Development: you@example.com (ABCDE12345)
+//   DEVELOPMENT_TEAM = ABCDE12345
+//
+// `security find-identity -v -p codesigning` lists the identities on your Mac.
+
+CODE_SIGN_STYLE = Manual
+CODE_SIGN_IDENTITY = -
+DEVELOPMENT_TEAM =
+PROVISIONING_PROFILE_SPECIFIER =
+
+#include? "Signing.local.xcconfig"
