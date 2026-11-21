@@ -167,6 +167,8 @@ final class Settings {
         }
     }
     /// Scribe: hold this key instead, and what you say comes back written up (or written for you).
+    /// Off until it is turned on in Settings, which is also what downloads its model: an install
+    /// that never uses Scribe downloads, loads and runs nothing for it.
     var scribeEnabled: Bool {
         didSet {
             defaults.set(scribeEnabled, forKey: "scribeEnabled")
@@ -226,7 +228,7 @@ final class Settings {
     init(defaults: UserDefaults = .standard) {
         self.defaults = defaults
         hotkey = Settings.loadCodable(Hotkey.self, "hotkey", defaults) ?? .default
-        scribeEnabled = defaults.object(forKey: "scribeEnabled") as? Bool ?? true
+        scribeEnabled = defaults.object(forKey: "scribeEnabled") as? Bool ?? false
         scribeHotkey = Settings.loadCodable(Hotkey.self, "scribeHotkey", defaults) ?? .rightCommand
         scribeUsesContext = defaults.object(forKey: "scribeUsesContext") as? Bool ?? true
         handsFreeEnabled = defaults.object(forKey: "handsFreeEnabled") as? Bool ?? true

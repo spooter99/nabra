@@ -64,7 +64,7 @@ final class ModelDownloader: NSObject, URLSessionDownloadDelegate {
         do {
             try? FileManager.default.removeItem(at: model.localURL)
             try FileManager.default.moveItem(at: location, to: model.localURL)
-            Log.info("Installed speech model \(model.id)")
+            Log.info("Installed model \(model.id)")
         } catch {
             errors[model.id] = error.localizedDescription
         }

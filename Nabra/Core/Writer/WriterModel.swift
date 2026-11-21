@@ -42,6 +42,14 @@ struct WriterModel: Equatable {
 
     var sizeDescription: String { ByteCountFormatter.string(fromByteCount: bytes + (drafter?.bytes ?? 0), countStyle: .file) }
 
+    /// Both files (the model and its drafter) for the shared downloader.
+    var downloads: [SpeechModel] {
+        [download] + (drafter.map { [$0.download(id: id + "-drafter", title: title + " drafter")] } ?? [])
+    }
+
+    /// The model and its drafter are both on disk.
+    var isFullyInstalled: Bool { isInstalled && (drafter?.isInstalled ?? true) }
+
     /// The same file described for the shared downloader.
     var download: SpeechModel {
         SpeechModel(id: id, title: title, detail: detail, fileName: fileName, bytes: bytes, url: url)

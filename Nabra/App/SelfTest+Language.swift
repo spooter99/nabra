@@ -238,6 +238,13 @@ extension SelfTest {
             expect(TextPipeline.process(input, options: TextPipeline.Options()).text, expected, "address: \(input)")
         }
 
+        // --- Scribe is off on a new install, so nothing is downloaded for it ---
+        let suite = "app.nabra.selftest.\(UUID().uuidString)"
+        if let fresh = UserDefaults(suiteName: suite) {
+            expect(Settings(defaults: fresh).scribeEnabled, false, "settings: Scribe is off until it is turned on")
+            fresh.removePersistentDomain(forName: suite)
+        }
+
         // --- Scribe: what to do with a dictation, and whether to trust what came back ---
         let jobs: [(String, Bool)] = [
             ("write an email to Ahmad telling him the meeting moved to Thursday", true),

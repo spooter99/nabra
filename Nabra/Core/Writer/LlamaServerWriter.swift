@@ -128,6 +128,15 @@ final class LlamaServerWriter: TextWriter {
         }
     }
 
+    /// Stops the helper now and frees its memory (Scribe was switched off). It starts again on next use.
+    func stopNow() {
+        queue.async { [self] in
+            idleWork?.cancel()
+            if process != nil { Log.info("Scribe: writing model stopped (Scribe was switched off)") }
+            stop()
+        }
+    }
+
     /// Stops the helper (the app is quitting).
     func shutdown() {
         queue.sync { stop() }

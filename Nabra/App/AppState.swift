@@ -108,10 +108,14 @@ final class AppState {
             self.hotkeys.update(hotkey: self.settings.hotkey, config: self.settings.gestureConfig)
             self.scribeHotkeys.update(hotkey: self.settings.scribeHotkey, config: self.settings.gestureConfig)
             self.updateHotkeyMonitor()
+            // Switched off, Scribe lets go of its model at once rather than after the idle wait.
+            if !self.settings.scribeEnabled { self.writer.stopNow() }
         }
 
-        downloads.onInstalled = { [weak self] _ in
+        downloads.onInstalled = { [weak self] model in
             guard let self else { return }
+            // Scribe's files are not speech models: there is nothing to reload for them.
+            guard !model.id.hasPrefix("writer-") else { return }
             self.transcription.refreshInstalledState()
             self.warmUp()
         }

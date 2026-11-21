@@ -33,7 +33,26 @@ struct SettingsView: View {
             }
 
             Section {
-                Toggle("Scribe", isOn: $settings.scribeEnabled)
+                Toggle("Scribe", isOn: Binding(
+                    get: { settings.scribeEnabled },
+                    set: { on in
+                        settings.scribeEnabled = on
+                        // Turning Scribe on is what downloads its model; nothing is fetched before that.
+                        let files = WriterModel.current.downloads
+                        if !on {
+                            files.forEach(state.downloads.cancel)
+                        } else if state.writer.helperURL != nil {
+                            files.forEach(state.downloads.download)
+                        }
+                    }))
+                if !settings.scribeEnabled {
+                    Text("Hold a second key and your words come back written up, or written for you. Turning Scribe on downloads its model (\(WriterModel.current.sizeDescription)) once. While it is off, nothing is downloaded, loaded or run for it.")
+                        .font(.system(size: 11.5))
+                        .foregroundStyle(.secondary)
+                    if WriterModel.current.isInstalled {
+                        WriterModelRow(model: WriterModel.current)
+                    }
+                }
                 if settings.scribeEnabled {
                     LabeledContent("Scribe key") {
                         ShortcutField(hotkey: $settings.scribeHotkey, other: settings.hotkey, otherName: "the dictation key",
@@ -316,9 +335,8 @@ private struct WriterModelRow: View {
 
     var body: some View {
         let download = model.download
-        let drafter = model.drafter?.download(id: model.id + "-drafter", title: model.title + " drafter")
         let progress = state.downloads.progress[download.id]
-        let installed = model.isInstalled && (model.drafter?.isInstalled ?? true)
+        let installed = model.isFullyInstalled
         HStack(spacing: 10) {
             Image(systemName: installed ? "checkmark.circle.fill" : "arrow.down.circle")
                 .foregroundStyle(installed ? Color.accentColor : Color.secondary)
@@ -340,24 +358,22 @@ private struct WriterModelRow: View {
                     .foregroundStyle(.secondary)
                     .frame(width: 34, alignment: .trailing)
                 Button("Cancel") {
-                    state.downloads.cancel(download)
-                    if let drafter { state.downloads.cancel(drafter) }
+                    // Scribe without its model would do nothing: cancelling switches it off.
+                    model.downloads.forEach(state.downloads.cancel)
+                    state.settings.scribeEnabled = false
                 }
                 .controlSize(.small)
             } else if installed {
                 Button("Delete") {
-                    state.downloads.delete(download)
-                    if let drafter { state.downloads.delete(drafter) }
+                    model.downloads.forEach(state.downloads.delete)
+                    state.settings.scribeEnabled = false
                 }
                 .controlSize(.small)
             } else if state.writer.helperURL == nil {
                 Text("Not included in this build").font(.system(size: 11.5)).foregroundStyle(.secondary)
             } else {
-                Button("Download") {
-                    state.downloads.download(download)
-                    if let drafter { state.downloads.download(drafter) }
-                }
-                .controlSize(.small)
+                Button("Download") { model.downloads.forEach(state.downloads.download) }
+                    .controlSize(.small)
             }
         }
     }
