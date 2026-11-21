@@ -29,8 +29,8 @@ targets:
       base:
         PRODUCT_BUNDLE_IDENTIFIER: app.nabra.Nabra
         PRODUCT_NAME: Nabra
-        MARKETING_VERSION: "1.0"
-        CURRENT_PROJECT_VERSION: "1"
+        MARKETING_VERSION: "1.1"
+        CURRENT_PROJECT_VERSION: "2"
         INFOPLIST_FILE: Nabra/Resources/Info.plist
         GENERATE_INFOPLIST_FILE: NO
         SWIFT_OBJC_BRIDGING_HEADER: Nabra/Support/Nabra-Bridging-Header.h
@@ -44,6 +44,19 @@ targets:
         DEAD_CODE_STRIPPING: YES
         SWIFT_OPTIMIZATION_LEVEL: "-O"
         GCC_OPTIMIZATION_LEVEL: "s"
+    postCompileScripts:
+      - name: Add Scribe's writing runtime
+        basedOnDependencyAnalysis: false
+        script: |
+          # llama.cpp's server, built by scripts/build-writer.sh. Without it Scribe stays off.
+          HELPER="$SRCROOT/vendor/writer-dist/nabra-writer"
+          DEST="$TARGET_BUILD_DIR/$EXECUTABLE_FOLDER_PATH/nabra-writer"
+          if [ -f "$HELPER" ]; then
+            cp "$HELPER" "$DEST"
+            codesign --force --sign "${EXPANDED_CODE_SIGN_IDENTITY:--}" --timestamp=none "$DEST"
+          else
+            rm -f "$DEST"
+          fi
     dependencies:
       # Listed as files (not -l flags) so Xcode relinks whenever the engine is rebuilt.
       - framework: vendor/engine-dist/lib/libtranscribe.a

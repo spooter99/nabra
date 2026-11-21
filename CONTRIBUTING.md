@@ -7,7 +7,7 @@ Thanks for wanting to improve Nabra. Issues and pull requests are welcome.
 ```bash
 git clone https://github.com/spooter99/nabra.git
 cd nabra
-scripts/build.sh          # builds build/Products/Release/Nabra.app
+scripts/build.sh          # builds build/Products/Release/Nabra.app (and, the first time, the speech engine and Scribe's helper)
 ```
 
 See the README for requirements. To keep macOS permissions between rebuilds, add your own signing
@@ -30,7 +30,16 @@ identity in `Config/Signing.local.xcconfig` (explained in `Config/Signing.xcconf
    $APP --eval eval/data/manifest.jsonl --mode auto --out out.jsonl && python3 eval/score.py out.jsonl
    ```
 
-3. Add a check to `Nabra/App/SelfTest.swift` for any new text rule or gesture.
+3. If you touched the key handling, the recorder or the dictation controller, run the whole loop
+   unattended. The app presses its own key, records, recognises and reports; nothing is typed
+   anywhere and your history is not used:
+
+   ```bash
+   scripts/check-loop.sh                # a spoken clip stands in for the microphone
+   scripts/check-loop.sh --microphone   # the real microphone; the log shows start-up timing
+   ```
+
+4. Add a check to `Nabra/App/SelfTest.swift` for any new text rule or gesture.
 
 ## Guidelines
 

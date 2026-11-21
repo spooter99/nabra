@@ -99,6 +99,16 @@ enum Accessibility {
         return (value, selectedRange(element))
     }
 
+    /// The element that has the keyboard focus in the app with `pid`, if that app is in front.
+    static func focusedElement(pid: pid_t) -> AXUIElement? {
+        guard NSWorkspace.shared.frontmostApplication?.processIdentifier == pid else { return nil }
+        let application = AXUIElementCreateApplication(pid)
+        AXUIElementSetMessagingTimeout(application, 0.2)
+        guard let element = focusedElement(of: application, pid: pid) else { return nil }
+        AXUIElementSetMessagingTimeout(element, 0.25)
+        return element
+    }
+
     /// Whether `element` is still the focused element of its application.
     static func isStillFocused(_ element: AXUIElement, pid: pid_t) -> Bool {
         guard NSWorkspace.shared.frontmostApplication?.processIdentifier == pid else { return false }

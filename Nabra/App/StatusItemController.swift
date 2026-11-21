@@ -47,12 +47,21 @@ final class StatusItemController: NSObject, NSMenuDelegate {
             headline = "Finish setup to start dictating"
         } else if state.transcription.state == .missingModel {
             headline = "Speech model not installed"
+        } else if state.permissions.keyboardIsSecured {
+            headline = "A password field has the keyboard: the key is hidden from Nabra"
         } else {
             headline = "Hold \(state.settings.hotkey.displayName) and speak"
         }
         let header = NSMenuItem(title: headline, action: nil, keyEquivalent: "")
         header.isEnabled = false
         menu.addItem(header)
+
+        if state.recorder.isMicrophoneOpen, state.dictation.phase == .idle {
+            // Kept open on purpose (Settings): say so, since macOS is showing its microphone indicator.
+            let open = NSMenuItem(title: "Microphone is on, ready for the next dictation", action: nil, keyEquivalent: "")
+            open.isEnabled = false
+            menu.addItem(open)
+        }
 
         let toggleTitle = state.dictation.phase == .listening ? "Finish Dictation" : "Start Dictation"
         let toggle = menu.addItem(withTitle: toggleTitle, action: #selector(toggleDictation), keyEquivalent: "")
@@ -83,6 +92,11 @@ final class StatusItemController: NSObject, NSMenuDelegate {
         let pasteLast = menu.addItem(withTitle: "Paste Last Dictation", action: #selector(pasteLast), keyEquivalent: "")
         pasteLast.target = self
         pasteLast.isEnabled = state.dictation.lastText != nil
+        if state.dictation.canRetry {
+            let retry = menu.addItem(withTitle: "Try the Last Recording Again", action: #selector(retryLast), keyEquivalent: "")
+            retry.target = self
+            retry.toolTip = "The last dictation produced no text. Transcribe the same recording once more."
+        }
         menu.addItem(.separator())
 
         let open = menu.addItem(withTitle: "Open Nabra", action: #selector(openApp), keyEquivalent: "")
@@ -94,6 +108,10 @@ final class StatusItemController: NSObject, NSMenuDelegate {
     }
 
     @objc private func toggleDictation() { state.dictation.toggle() }
+    @objc private func retryLast() {
+        // Let the menu close and the previous app regain focus first, so the text lands there.
+        DispatchQueue.main.asyncAfter(deadline: .now() + 0.25) { [weak self] in self?.state.dictation.retryLast() }
+    }
     @objc private func pasteLast() {
         // Let the menu close and the previous app regain focus first.
         DispatchQueue.main.asyncAfter(deadline: .now() + 0.25) { [weak self] in self?.state.dictation.pasteLast() }

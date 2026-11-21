@@ -12,7 +12,9 @@ Nabra builds on the work of others. Their code and models keep their own licence
   Apache-2.0. The speech model, downloaded by the app on first run in the GGUF build published at
   https://huggingface.co/handy-computer/cohere-transcribe-arabic-07-2026-gguf.
 - Silero VAD (https://github.com/snakers4/silero-vad), MIT. Finds speech in the recording.
-- VoxLingua107 ECAPA-TDNN language identification
-  (https://huggingface.co/speechbrain/lang-id-voxlingua107-ecapa), Apache-2.0.
+- llama.cpp (https://github.com/ggml-org/llama.cpp), MIT. Runs Scribe's writing model; built from
+  source as the bundled helper nabra-writer.
+- Gemma 4 E2B (https://huggingface.co/ggml-org/gemma-4-E2B-it-GGUF), Apache-2.0, by Google. Scribe's
+  writing model, downloaded by the app when Scribe is first set up.
 
 None of these projects endorse Nabra.

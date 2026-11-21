@@ -92,6 +92,34 @@ enum IndicatorPosition: String, CaseIterable, Identifiable, Codable {
     }
 }
 
+/// When the microphone is switched on.
+enum MicrophoneReadiness: String, CaseIterable, Identifiable, Codable {
+    case onDemand
+    case lingering
+    case always
+
+    var id: String { rawValue }
+
+    var title: String {
+        switch self {
+        case .onDemand: return "When I press the key"
+        case .lingering: return "Stays on for a minute after dictating"
+        case .always: return "Always on"
+        }
+    }
+
+    var detail: String {
+        switch self {
+        case .onDemand:
+            return "A built-in microphone needs about a fifth of a second after the key goes down before it hears anything. Speak when the indicator comes alive, or pick another option to never lose the first word."
+        case .lingering:
+            return "While you are dictating one thing after another, nothing is missed, not even the first syllable. The microphone stays on for a minute after each dictation, and macOS shows its orange dot for that time. Nothing is recorded or kept unless you hold the key."
+        case .always:
+            return "Not even the first syllable is ever missed. The microphone is on whenever Nabra runs, so macOS shows its orange dot all the time. Nothing is recorded or kept unless you hold the key."
+        }
+    }
+}
+
 enum AudioRetention: String, CaseIterable, Identifiable, Codable {
     case never
     case week
@@ -138,6 +166,21 @@ final class Settings {
             NotificationCenter.default.post(name: .nabraHotkeySettingsChanged, object: nil)
         }
     }
+    /// Scribe: hold this key instead, and what you say comes back written up (or written for you).
+    var scribeEnabled: Bool {
+        didSet {
+            defaults.set(scribeEnabled, forKey: "scribeEnabled")
+            NotificationCenter.default.post(name: .nabraHotkeySettingsChanged, object: nil)
+        }
+    }
+    var scribeHotkey: Hotkey {
+        didSet {
+            saveCodable(scribeHotkey, "scribeHotkey")
+            NotificationCenter.default.post(name: .nabraHotkeySettingsChanged, object: nil)
+        }
+    }
+    /// Let Scribe see which app you are in and the text around the cursor, to match names and tone.
+    var scribeUsesContext: Bool { didSet { defaults.set(scribeUsesContext, forKey: "scribeUsesContext") } }
 
     var languageMode: LanguageMode { didSet { defaults.set(languageMode.rawValue, forKey: "languageMode") } }
     var modelID: String { didSet { defaults.set(modelID, forKey: "modelID") } }
@@ -150,8 +193,10 @@ final class Settings {
     var learnFromCorrections: Bool { didSet { defaults.set(learnFromCorrections, forKey: "learnFromCorrections") } }
     /// Mute sustained speech much quieter than your own voice (people talking across the room).
     var ignoreBackgroundVoices: Bool { didSet { defaults.set(ignoreBackgroundVoices, forKey: "ignoreBackgroundVoices") } }
-    /// Turn spoken lists ("first… second…") into numbered lists.
+    /// Turn spoken lists ("one, … two, …", "first, … second, …") into numbered lists.
     var formatLists: Bool { didSet { defaults.set(formatLists, forKey: "formatLists") } }
+    /// Break long dictations into paragraphs.
+    var formatParagraphs: Bool { didSet { defaults.set(formatParagraphs, forKey: "formatParagraphs") } }
 
     var insertionMethod: InsertionMethod { didSet { defaults.set(insertionMethod.rawValue, forKey: "insertionMethod") } }
     var restoreClipboard: Bool { didSet { defaults.set(restoreClipboard, forKey: "restoreClipboard") } }
@@ -168,6 +213,11 @@ final class Settings {
 
     /// Core Audio UID of the chosen microphone, or nil for the system default.
     var inputDeviceUID: String? { didSet { defaults.set(inputDeviceUID, forKey: "inputDeviceUID") } }
+    /// Whether the microphone stays on between dictations, so not even the first syllable is lost.
+    /// It opens on demand by default: macOS shows its microphone indicator for as long as it is on.
+    var microphoneReadiness: MicrophoneReadiness {
+        didSet { defaults.set(microphoneReadiness.rawValue, forKey: "microphoneReadiness") }
+    }
     var audioRetention: AudioRetention { didSet { defaults.set(audioRetention.rawValue, forKey: "audioRetention") } }
     var saveHistory: Bool { didSet { defaults.set(saveHistory, forKey: "saveHistory") } }
 
@@ -176,6 +226,9 @@ final class Settings {
     init(defaults: UserDefaults = .standard) {
         self.defaults = defaults
         hotkey = Settings.loadCodable(Hotkey.self, "hotkey", defaults) ?? .default
+        scribeEnabled = defaults.object(forKey: "scribeEnabled") as? Bool ?? true
+        scribeHotkey = Settings.loadCodable(Hotkey.self, "scribeHotkey", defaults) ?? .rightCommand
+        scribeUsesContext = defaults.object(forKey: "scribeUsesContext") as? Bool ?? true
         handsFreeEnabled = defaults.object(forKey: "handsFreeEnabled") as? Bool ?? true
         languageMode = LanguageMode(rawValue: defaults.string(forKey: "languageMode") ?? "") ?? .auto
         modelID = defaults.string(forKey: "modelID") ?? SpeechModel.defaultID
@@ -186,6 +239,7 @@ final class Settings {
         learnFromCorrections = defaults.object(forKey: "learnFromCorrections") as? Bool ?? true
         ignoreBackgroundVoices = defaults.object(forKey: "ignoreBackgroundVoices") as? Bool ?? false
         formatLists = defaults.object(forKey: "formatLists") as? Bool ?? true
+        formatParagraphs = defaults.object(forKey: "formatParagraphs") as? Bool ?? true
         insertionMethod = InsertionMethod(rawValue: defaults.string(forKey: "insertionMethod") ?? "") ?? .paste
         restoreClipboard = defaults.object(forKey: "restoreClipboard") as? Bool ?? true
         smartSpacing = defaults.object(forKey: "smartSpacing") as? Bool ?? true
@@ -194,6 +248,7 @@ final class Settings {
         showLiveText = defaults.object(forKey: "showLiveText") as? Bool ?? false
         indicatorPosition = IndicatorPosition(rawValue: defaults.string(forKey: "indicatorPosition") ?? "") ?? .bottom
         inputDeviceUID = defaults.string(forKey: "inputDeviceUID")
+        microphoneReadiness = MicrophoneReadiness(rawValue: defaults.string(forKey: "microphoneReadiness") ?? "") ?? .onDemand
         audioRetention = AudioRetention(rawValue: defaults.string(forKey: "audioRetention") ?? "") ?? .week
         saveHistory = defaults.object(forKey: "saveHistory") as? Bool ?? true
         onboardingCompleted = defaults.bool(forKey: "onboardingCompleted")

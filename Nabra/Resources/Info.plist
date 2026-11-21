@@ -33,7 +33,7 @@
 	<key>NSHumanReadableCopyright</key>
 	<string>Open source under the Apache License 2.0. Speech never leaves this Mac.</string>
 	<key>NSMicrophoneUsageDescription</key>
-	<string>Nabra listens only while you hold your dictation key, and turns what you say into text on this Mac. Audio never leaves your device.</string>
+	<string>Nabra records only while you hold your dictation key, and turns what you say into text on this Mac. Audio never leaves your device.</string>
 	<key>NSPrincipalClass</key>
 	<string>NSApplication</string>
 	<key>NSSupportsAutomaticTermination</key>

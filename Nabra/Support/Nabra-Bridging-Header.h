@@ -3,7 +3,6 @@
 
 #include "transcribe.h"
 #include "transcribe/vad.h"
-#include "transcribe/langid.h"
 #import "ObjCSupport.h"
 
 #endif

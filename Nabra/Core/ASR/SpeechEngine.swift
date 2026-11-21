@@ -12,6 +12,23 @@ final class SpeechEngine {
         /// Decode the same audio as the previous call again (under another language hint),
         /// skipping the encoder. Only valid immediately after a decode of identical audio.
         var reuseEncoder = false
+        /// Also work out when each piece of text was heard (`Token.time`). Costs a little decode time.
+        var tokenTimes = false
+        /// Do not transcribe: feed the model these token ids and report how probable it finds them
+        /// for this audio. Used to let the model judge a transcript assembled from other decodes.
+        var forcedTokens: [Int32] = []
+    }
+
+    /// One piece of the decoded text (a word or part of one).
+    struct Token {
+        /// The model's id for this piece.
+        var id: Int32
+        /// The text fragment; a leading space marks the start of a word.
+        var text: String
+        /// Natural log of the model's probability for this piece. NaN when unknown.
+        var logProbability: Float
+        /// Where in the audio the model was listening when it wrote this piece, in seconds. NaN when unknown.
+        var time: Float = .nan
     }
 
     struct Result {
@@ -29,6 +46,10 @@ final class SpeechEngine {
         var failed: Bool = false
         /// The decoder stopped early (output budget or repetition guard): the text is incomplete.
         var truncated: Bool = false
+        /// The pieces the text was built from, in order.
+        var tokens: [Token] = []
+        /// Log-probability the model gave to the text ending where it does. NaN when unknown.
+        var endLogProbability: Float = .nan
     }
 
     enum EngineError: LocalizedError {
@@ -98,7 +119,9 @@ final class SpeechEngine {
     /// Runs one short decode so the Metal pipelines are compiled before the first real request.
     func warmUp() {
         let silence = [Float](repeating: 0, count: SpeechEngine.sampleRate)
-        _ = transcribe(silence, options: Options(language: "en"))
+        // Silence alone ends before the decoder takes a single step, so feed it a few pieces: that
+        // exercises the step graph, including the attention read-out used for word times.
+        _ = transcribe(silence, options: Options(language: "en", tokenTimes: true, forcedTokens: [1000, 1001, 1002, 1003]))
     }
 
     func transcribe(_ samples: [Float], options: Options) -> Result {
@@ -120,7 +143,21 @@ final class SpeechEngine {
         params.timestamps = TRANSCRIBE_TIMESTAMPS_NONE
 
         transcribe_cohere_set_reuse_encoder(options.reuseEncoder)
-        defer { transcribe_cohere_set_reuse_encoder(false) }
+        if options.tokenTimes {
+            TokenTiming.alignmentHeads.withUnsafeBufferPointer {
+                transcribe_cohere_set_alignment_heads($0.baseAddress, Int32($0.count / 2))
+            }
+        }
+        if !options.forcedTokens.isEmpty {
+            options.forcedTokens.withUnsafeBufferPointer {
+                transcribe_cohere_set_forced_tokens($0.baseAddress, Int32($0.count))
+            }
+        }
+        defer {
+            transcribe_cohere_set_reuse_encoder(false)
+            transcribe_cohere_set_alignment_heads(nil, 0)
+            transcribe_cohere_set_forced_tokens(nil, 0)
+        }
         let status: transcribe_status = options.language.withCString { language in
             params.language = language
             if input.count >= SpeechEngine.minimumSamples {
@@ -158,8 +195,12 @@ final class SpeechEngine {
         for index in 0..<tokenCount {
             var token = transcribe_token()
             transcribe_token_init(&token)
-            guard transcribe_get_token(session, index, &token) == TRANSCRIBE_OK, token.text != nil else { continue }
-            guard token.p.isFinite, token.p > 0 else { continue }
+            guard transcribe_get_token(session, index, &token) == TRANSCRIBE_OK, let text = token.text else { continue }
+            let known = token.p.isFinite && token.p > 0
+            result.tokens.append(Token(id: token.id, text: String(cString: text),
+                                       logProbability: known ? log(token.p) : .nan,
+                                       time: token.t1_ms > 0 ? Float(token.t0_ms) / 1000 : .nan))
+            guard known else { continue }
             logProbabilitySum += log(token.p)
             counted += 1
         }
@@ -167,6 +208,7 @@ final class SpeechEngine {
         // The stock library reports no per-token probabilities for this model; the local patch does.
         result.averageLogProbability = counted > 0 ? logProbabilitySum / Float(counted)
             : transcribe_cohere_last_avg_logprob()
+        result.endLogProbability = transcribe_cohere_last_end_logprob()
         return result
     }
 
@@ -174,4 +216,12 @@ final class SpeechEngine {
         guard let text = transcribe_status_string(Int32(status.rawValue)) else { return "status \(status.rawValue)" }
         return String(cString: text)
     }
+}
+
+/// Which parts of the decoder tell where in the audio a token came from.
+enum TokenTiming {
+    /// (layer, head) pairs of the decoder's cross-attention that move steadily through the audio as
+    /// text is written. Found by dumping every head on a set of recordings and keeping the ones
+    /// that agree with each other (`eval/tools/alignment_heads.py`); they belong to this model.
+    static let alignmentHeads: [Int32] = [6, 3, 3, 0, 1, 6, 4, 1, 5, 6, 6, 7]
 }

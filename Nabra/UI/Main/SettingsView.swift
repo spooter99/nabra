@@ -13,10 +13,9 @@ struct SettingsView: View {
 
         Form {
             Section {
-                Picker("Dictation key", selection: $settings.hotkey) {
-                    ForEach(Hotkey.presets, id: \.self) { hotkey in
-                        Text(hotkey.longName).tag(hotkey)
-                    }
+                LabeledContent("Dictation key") {
+                    ShortcutField(hotkey: $settings.hotkey, other: settings.scribeHotkey, otherName: "the Scribe key",
+                                  presets: Hotkey.presets)
                 }
                 Toggle("Double-tap for hands-free", isOn: $settings.handsFreeEnabled)
                 if settings.hotkey.isFunctionKey {
@@ -25,12 +24,34 @@ struct SettingsView: View {
                         .font(.system(size: 11.5))
                         .foregroundStyle(.secondary)
                 } else if settings.hotkey == .eitherOption || settings.hotkey == .leftOption {
-                    Text("Shortcuts such as ⌥← and ⌥⌫ keep working: dictation only starts when the key is held on its own. The right Option key starts instantly; the left one waits a fraction of a second to be sure.")
+                    Text("Shortcuts such as ⌥← and ⌥⌫ keep working: dictation only starts when the key is held on its own. The microphone is switched on the moment the key goes down. With the left Option key the indicator appears a fraction of a second later, once it is clear you are not typing a shortcut.")
                         .font(.system(size: 11.5))
                         .foregroundStyle(.secondary)
                 }
             } header: {
                 Text("Shortcut")
+            }
+
+            Section {
+                Toggle("Scribe", isOn: $settings.scribeEnabled)
+                if settings.scribeEnabled {
+                    LabeledContent("Scribe key") {
+                        ShortcutField(hotkey: $settings.scribeHotkey, other: settings.hotkey, otherName: "the dictation key",
+                                      presets: Hotkey.scribePresets)
+                    }
+                    if settings.scribeHotkey.overlaps(settings.hotkey) {
+                        Label("This is also the dictation key. Pick another one for Scribe.", systemImage: "exclamationmark.triangle")
+                            .font(.system(size: 11.5))
+                            .foregroundStyle(.orange)
+                    }
+                    WriterModelRow(model: WriterModel.current)
+                    Toggle("Let Scribe see the app and the text before the cursor", isOn: $settings.scribeUsesContext)
+                    Text("Hold the Scribe key and talk. Your words come back written up: grammar fixed, self-corrections applied, the way you would write it. Ask for something (“write an email to Sara saying the meeting moved to Thursday”) and you get that text. It runs on a small language model on this Mac, in Arabic and English.")
+                        .font(.system(size: 11.5))
+                        .foregroundStyle(.secondary)
+                }
+            } header: {
+                Text("Scribe")
             }
 
             Section {
@@ -58,7 +79,8 @@ struct SettingsView: View {
                     .foregroundStyle(.secondary)
                 Toggle("Remove “um” and “uh”", isOn: $settings.removeFillers)
                 Toggle("Say “new line” or “new paragraph” to break lines", isOn: $settings.voiceCommands)
-                Toggle("Turn spoken lists into numbered lists (“first… second…”)", isOn: $settings.formatLists)
+                Toggle("Turn spoken lists into lists (“one, … two, …”, or “here is the list: …”)", isOn: $settings.formatLists)
+                Toggle("Break long dictations into paragraphs", isOn: $settings.formatParagraphs)
                 Toggle("Learn spellings from my corrections", isOn: $settings.learnFromCorrections)
                 Toggle("Add spaces and adjust capitals to fit the surrounding text", isOn: $settings.smartSpacing)
             } header: {
@@ -98,6 +120,15 @@ struct SettingsView: View {
                         Text(device.name).tag(String?.some(device.uid))
                     }
                 }
+                Picker("Microphone is on", selection: $settings.microphoneReadiness) {
+                    ForEach(MicrophoneReadiness.allCases) { readiness in
+                        Text(readiness.title).tag(readiness)
+                    }
+                }
+                Text(settings.microphoneReadiness.detail
+                    + (settings.microphoneReadiness == .onDemand ? "" : " Bluetooth microphones are still switched on only while you dictate."))
+                    .font(.system(size: 11.5))
+                    .foregroundStyle(.secondary)
                 Picker("Insert text by", selection: $settings.insertionMethod) {
                     ForEach(InsertionMethod.allCases) { method in
                         Text(method.title).tag(method)
@@ -275,6 +306,60 @@ private struct ModelRow: View {
             }
         }
         .contentShape(Rectangle())
+    }
+}
+
+/// Scribe's writing model: download, progress, or ready.
+private struct WriterModelRow: View {
+    @Environment(AppState.self) private var state
+    var model: WriterModel
+
+    var body: some View {
+        let download = model.download
+        let drafter = model.drafter?.download(id: model.id + "-drafter", title: model.title + " drafter")
+        let progress = state.downloads.progress[download.id]
+        let installed = model.isInstalled && (model.drafter?.isInstalled ?? true)
+        HStack(spacing: 10) {
+            Image(systemName: installed ? "checkmark.circle.fill" : "arrow.down.circle")
+                .foregroundStyle(installed ? Color.accentColor : Color.secondary)
+                .font(.system(size: 15))
+            VStack(alignment: .leading, spacing: 2) {
+                HStack(spacing: 6) {
+                    Text(model.title).fontWeight(.medium)
+                    Text(model.sizeDescription).foregroundStyle(.secondary).font(.system(size: 11.5))
+                }
+                Text(state.downloads.errors[download.id] ?? (installed ? "Ready. It runs only while you use Scribe." : model.detail))
+                    .font(.system(size: 11.5))
+                    .foregroundStyle(state.downloads.errors[download.id] == nil ? Color.secondary : Color.red)
+            }
+            Spacer()
+            if let progress {
+                ProgressView(value: progress).frame(width: 90)
+                Text("\(Int(progress * 100))%")
+                    .font(.system(size: 11).monospacedDigit())
+                    .foregroundStyle(.secondary)
+                    .frame(width: 34, alignment: .trailing)
+                Button("Cancel") {
+                    state.downloads.cancel(download)
+                    if let drafter { state.downloads.cancel(drafter) }
+                }
+                .controlSize(.small)
+            } else if installed {
+                Button("Delete") {
+                    state.downloads.delete(download)
+                    if let drafter { state.downloads.delete(drafter) }
+                }
+                .controlSize(.small)
+            } else if state.writer.helperURL == nil {
+                Text("Not included in this build").font(.system(size: 11.5)).foregroundStyle(.secondary)
+            } else {
+                Button("Download") {
+                    state.downloads.download(download)
+                    if let drafter { state.downloads.download(drafter) }
+                }
+                .controlSize(.small)
+            }
+        }
     }
 }
 

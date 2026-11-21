@@ -10,6 +10,8 @@ final class HUDModel {
         case processing
         case success
         case notice
+        /// Scribe is writing: the pill opens up and shows the text as it is generated.
+        case writing
     }
 
     var mode: Mode = .hidden
@@ -18,8 +20,15 @@ final class HUDModel {
     var noticeText = ""
     var noticeSymbol = "info.circle.fill"
     var noticeIsError = false
+    /// A button on the notice ("Try again"), or nil.
+    var noticeAction: String?
+    @ObservationIgnored var onNoticeAction: (() -> Void)?
     var liveText = ""
+    /// What Scribe has written so far.
+    var writingText = ""
     var listeningSince = Date()
+    /// False while the microphone has been asked to start but is not being heard yet.
+    var isLive = true
 
     /// Where on the screen the indicator is drawn.
     enum Placement: Equatable {

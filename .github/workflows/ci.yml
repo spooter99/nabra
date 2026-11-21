@@ -23,6 +23,12 @@ jobs:
             vendor/engine-dist
           key: engine-${{ runner.os }}-${{ hashFiles('scripts/build-engine.sh', 'vendor/patches/**') }}
 
+      - name: Cache Scribe's helper
+        uses: actions/cache@v6
+        with:
+          path: vendor/writer-dist
+          key: writer-${{ runner.os }}-${{ hashFiles('scripts/build-writer.sh') }}
+
       - name: Build
         run: scripts/build.sh Release
 

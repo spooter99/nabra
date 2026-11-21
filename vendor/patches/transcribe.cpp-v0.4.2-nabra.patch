@@ -1,8 +1,65 @@
 diff --git a/src/arch/cohere/decoder.cpp b/src/arch/cohere/decoder.cpp
-index 4ef7d11..5682f00 100644
+index 4ef7d11..d9b89a6 100644
 --- a/src/arch/cohere/decoder.cpp
 +++ b/src/arch/cohere/decoder.cpp
-@@ -888,6 +888,11 @@ StepBuild build_step_graph(ggml_context *        ctx,
+@@ -372,11 +372,17 @@ ggml_tensor * mha_cross_cached(ggml_context *  ctx,
+                                int             hidden,
+                                int             il,
+                                int             T_enc,
+-                               bool            use_flash) {
++                               bool            use_flash,
++                               ggml_tensor **  attn_out = nullptr) {
+     const int     head_dim = hidden / n_heads;
+     const float   scale    = 1.0f / std::sqrt(static_cast<float>(head_dim));
+     const int64_t n_tokens = x->ne[1];
+ 
++    // [nabra] the fused kernel never materialises the attention weights
++    if (attn_out != nullptr) {
++        use_flash = false;
++    }
++
+     // Only Q is computed from current input. K/V come from cache.
+     ggml_tensor * Qcur = ggml_mul_mat(ctx, q_w, x);
+     if (q_b != nullptr) {
+@@ -408,6 +414,9 @@ ggml_tensor * mha_cross_cached(ggml_context *  ctx,
+         // K: [head_dim, T_enc, n_heads, 1]; V transposed for the value matmul.
+         ggml_tensor * kq      = ggml_mul_mat(ctx, K, Q);
+         ggml_tensor * kq_soft = ggml_soft_max_ext(ctx, kq, nullptr, scale, 0.0f);
++        if (attn_out != nullptr) {
++            *attn_out = kq_soft;  // [nabra] [T_enc, n_tokens, n_heads]
++        }
+         ggml_tensor * v_t     = ggml_cont(ctx, ggml_permute(ctx, V, 1, 0, 2, 3));
+         o                     = ggml_mul_mat(ctx, v_t, kq_soft);
+         o                     = ggml_permute(ctx, o, 0, 2, 1, 3);
+@@ -793,7 +802,8 @@ StepBuild build_step_graph(ggml_context *        ctx,
+                            CohereKvCache &       kv_cache,
+                            int                   max_n_kv,
+                            int                   T_enc,
+-                           bool                  use_flash) {
++                           bool                  use_flash,
++                           uint64_t              attention_layers) {
+     StepBuild sb{};
+     sb.max_n_kv = max_n_kv;
+ 
+@@ -854,9 +864,15 @@ StepBuild build_step_graph(ggml_context *        ctx,
+         // are pre-populated full T_enc, no n_past dependency.
+         {
+             ggml_tensor * x_norm = layer_norm(ctx, x, blk.norm_cross_w, blk.norm_cross_b);
+-            ggml_tensor * cross_out =
++            // [nabra] expose this layer's cross-attention weights when asked to
++            const bool     want_attn = i < 64 && ((attention_layers >> i) & 1u) != 0;
++            ggml_tensor ** attn_slot = want_attn ? &sb.cross_attn_out[i] : nullptr;
++            ggml_tensor *  cross_out =
+                 mha_cross_cached(ctx, x_norm, kv_cache, blk.cross_q_w, blk.cross_q_b, blk.cross_out_w, blk.cross_out_b,
+-                                 n_heads, static_cast<int>(hidden), i, T_enc, use_flash);
++                                 n_heads, static_cast<int>(hidden), i, T_enc, use_flash, attn_slot);
++            if (want_attn && sb.cross_attn_out[i] != nullptr) {
++                ggml_set_output(sb.cross_attn_out[i]);
++            }
+             x = ggml_add(ctx, x, cross_out);
+         }
+ 
+@@ -888,6 +904,11 @@ StepBuild build_step_graph(ggml_context *        ctx,
          logits = ggml_add(ctx, logits, w.head.bias);
      }
  
@@ -15,25 +72,55 @@ index 4ef7d11..5682f00 100644
      ggml_set_name(sb.argmax_out, "step.argmax");
      ggml_set_output(sb.argmax_out);
 diff --git a/src/arch/cohere/decoder.h b/src/arch/cohere/decoder.h
-index 05b7589..2557150 100644
+index 05b7589..165dd83 100644
 --- a/src/arch/cohere/decoder.h
 +++ b/src/arch/cohere/decoder.h
-@@ -100,6 +100,7 @@ struct StepBuild {
+@@ -18,6 +18,8 @@
+ 
+ #include "ggml.h"
+ 
++#include <cstdint>
++
+ struct ggml_context;
+ struct ggml_tensor;
+ struct ggml_cgraph;
+@@ -100,17 +102,23 @@ struct StepBuild {
      ggml_tensor * kv_idx_in   = nullptr;  // i64 [1]
      ggml_tensor * mask_in     = nullptr;  // f16 [max_n_kv, 1]
      ggml_tensor * argmax_out  = nullptr;  // i32 [1]
 +    ggml_tensor * logits_out  = nullptr;  // [nabra] f32 [vocab, 1], kept readable for confidence
++    // [nabra] per-layer cross-attention weights, f32 [T_enc, 1, n_heads]; null unless requested
++    ggml_tensor * cross_attn_out[64] = {};
      int           max_n_kv    = 0;
      ggml_cgraph * graph       = nullptr;
  };
+ 
++// attention_layers: [nabra] bit i set = keep layer i's cross-attention weights readable
++// (that layer then uses the unfused attention path).
+ StepBuild build_step_graph(ggml_context *        compute_ctx,
+                            const CohereWeights & weights,
+                            const CohereHParams & hp,
+                            CohereKvCache &       kv_cache,
+                            int                   max_n_kv,
+                            int                   T_enc,
+-                           bool                  use_flash = true);
++                           bool                  use_flash        = true,
++                           uint64_t              attention_layers = 0);
+ 
+ // ---------------------------------------------------------------------------
+ // Offline batched decode (B utterances at once).
 diff --git a/src/arch/cohere/model.cpp b/src/arch/cohere/model.cpp
-index e7f9e05..114267b 100644
+index e7f9e05..44a05a6 100644
 --- a/src/arch/cohere/model.cpp
 +++ b/src/arch/cohere/model.cpp
-@@ -27,6 +27,22 @@
+@@ -27,6 +27,56 @@
  #include "transcribe-repetition-guard.h"
  #include "weights.h"
  
++#include <cstdint>
++#include <utility>
++#include <vector>
++
 +// [nabra] Mean log-probability of the tokens chosen by the most recent single-utterance decode on
 +// this thread (0 when nothing was decoded). Lets a caller compare two decodes of the same audio.
 +static thread_local float g_nabra_cohere_avg_logprob = 0.0f;
@@ -50,10 +137,40 @@ index e7f9e05..114267b 100644
 +    g_nabra_cohere_reuse_encoder = reuse;
 +}
 +
++// [nabra] Decoder cross-attention heads that follow the audio position of the token being written
++// ("alignment heads"), as (layer, head) pairs. While set, decodes on this thread report every
++// token through transcribe_get_token with its probability and the time it was heard at: t0_ms is
++// the median of the heads' strongest frame, t1_ms one frame later (both 0 when unknown).
++// [nabra] When non-empty, the next decodes on this thread do not choose tokens themselves: they
++// are fed exactly these ids and report how probable the model finds each one for this audio
++// ("teacher forcing"). Lets a caller ask the model to judge a transcript it did not write.
++static thread_local std::vector<int32_t> g_nabra_cohere_forced_tokens;
++extern "C" void transcribe_cohere_set_forced_tokens(const int32_t * ids, int n) {
++    g_nabra_cohere_forced_tokens.clear();
++    if (ids != nullptr && n > 0) {
++        g_nabra_cohere_forced_tokens.assign(ids, ids + n);
++    }
++}
++
++// [nabra] Log-probability the most recent decode on this thread gave to stopping where it stopped
++// (NaN when unknown). Low for a forced transcript that leaves speech out.
++static thread_local float g_nabra_cohere_end_logprob = 0.0f;
++extern "C" float transcribe_cohere_last_end_logprob(void) {
++    return g_nabra_cohere_end_logprob;
++}
++
++static thread_local std::vector<std::pair<int, int>> g_nabra_cohere_alignment_heads;
++extern "C" void transcribe_cohere_set_alignment_heads(const int32_t * layer_head_pairs, int n_pairs) {
++    g_nabra_cohere_alignment_heads.clear();
++    for (int i = 0; layer_head_pairs != nullptr && i < n_pairs; ++i) {
++        g_nabra_cohere_alignment_heads.emplace_back(layer_head_pairs[2 * i], layer_head_pairs[2 * i + 1]);
++    }
++}
++
  #include <algorithm>
  #include <cmath>
  #include <cstdint>
-@@ -669,6 +685,46 @@ transcribe_status run(transcribe_session *          session,
+@@ -669,6 +719,46 @@ transcribe_status run(transcribe_session *          session,
  
      transcribe::debug::init();
  
@@ -100,7 +217,7 @@ index e7f9e05..114267b 100644
      // ----- Mel front-end -------------------------------------------
      if (!cm->mel.has_value()) {
          log_msg(TRANSCRIBE_LOG_LEVEL_ERROR, "cohere run: model has no MelFrontend (load skipped?)");
-@@ -726,14 +782,6 @@ transcribe_status run(transcribe_session *          session,
+@@ -726,14 +816,6 @@ transcribe_status run(transcribe_session *          session,
          }
      }
  
@@ -115,7 +232,7 @@ index e7f9e05..114267b 100644
      EncoderBuild eb = build_encoder_graph(cc->compute_ctx, cm->weights, cm->hparams, mel_n_frames, resolved_kv,
                                            cc->encoder_use_flash, cm->backend.c_str());
      if (eb.mel_in == nullptr || eb.out == nullptr || eb.graph == nullptr) {
-@@ -801,13 +849,6 @@ transcribe_status run(transcribe_session *          session,
+@@ -801,13 +883,6 @@ transcribe_status run(transcribe_session *          session,
      }
      cc->t_encode_us = ggml_time_us() - t_enc_start;
  
@@ -129,7 +246,7 @@ index e7f9e05..114267b 100644
      // Pre-encode sub-stage dumps for debugging.
      try_dump("enc.pre_encode.out", eb.dumps.pre_encode_out, "encoder.pre_encode");
      try_dump("enc.block.0.out", eb.dumps.block0_out, "encoder.block0.out");
-@@ -838,6 +879,10 @@ transcribe_status run(transcribe_session *          session,
+@@ -838,6 +913,10 @@ transcribe_status run(transcribe_session *          session,
      }
      cc->enc_host.resize(static_cast<size_t>(d_enc) * static_cast<size_t>(T_enc));
      ggml_backend_tensor_get(eb.out, cc->enc_host.data(), 0, cc->enc_host.size() * sizeof(float));
@@ -140,7 +257,112 @@ index e7f9e05..114267b 100644
  
      // ----- Decoder with KV cache ------------------------------------
      //
-@@ -1181,6 +1226,12 @@ transcribe_status run(transcribe_session *          session,
+@@ -1079,11 +1158,53 @@ transcribe_status run(transcribe_session *          session,
+             }
+         }
+ 
++        // [nabra] forced transcript and the first token's probability
++        const std::vector<int32_t> & nabra_forced       = g_nabra_cohere_forced_tokens;
++        const bool                   nabra_is_forced    = !nabra_forced.empty();
++        float                        nabra_first_logprob = std::nanf("");
++        g_nabra_cohere_end_logprob = std::nanf("");
++        if (db.out != nullptr && db.out->type == GGML_TYPE_F32) {
++            const int64_t      vocab = db.out->ne[0];
++            std::vector<float> row(static_cast<size_t>(vocab));
++            ggml_backend_tensor_get(db.out, row.data(),
++                                    static_cast<size_t>(prompt_len - 1) * static_cast<size_t>(vocab) * sizeof(float),
++                                    static_cast<size_t>(vocab) * sizeof(float));
++            if (nabra_is_forced && nabra_forced[0] >= 0 && nabra_forced[0] < vocab) {
++                next_token = nabra_forced[0];
++            }
++            float top = row[0];
++            for (int64_t j = 1; j < vocab; ++j) {
++                top = std::max(top, row[j]);
++            }
++            double sum = 0.0;
++            for (int64_t j = 0; j < vocab; ++j) {
++                sum += std::exp(static_cast<double>(row[j] - top));
++            }
++            const double lse = static_cast<double>(top) + std::log(sum);
++            if (next_token >= 0 && next_token < vocab) {
++                nabra_first_logprob = static_cast<float>(row[next_token] - lse);
++            }
++            if (next_token == eos_id) {
++                g_nabra_cohere_end_logprob = nabra_first_logprob;
++            }
++        }
++
+         std::vector<int> generated_ids;
+         if (next_token != eos_id) {
+             generated_ids.push_back(next_token);
+         }
+ 
++        // [nabra] one entry per generated token: log-probability and encoder frame it was heard at
++        // (NaN = unknown; the first token comes from the prompt pass and has no frame).
++        std::vector<float> nabra_tok_logprob;
++        std::vector<float> nabra_tok_frame;
++        std::vector<float> nabra_tok_attn;         // research dump only: [token][layer][head][frame]
++        int                nabra_attn_stride = 0;  // floats per token in nabra_tok_attn
++        if (next_token != eos_id) {
++            nabra_tok_logprob.push_back(nabra_first_logprob);
++            nabra_tok_frame.push_back(std::nanf(""));
++        }
++
+         // Commit accumulated generated_ids as the run's segment + full
+         // text. Called both on normal loop exit and on abort so the
+         // public contract (partial result on TRANSCRIBE_ERR_ABORTED)
+@@ -1119,6 +1240,24 @@ transcribe_status run(transcribe_session *          session,
+             cc->full_text   = std::move(full);
+             cc->result_kind = TRANSCRIBE_TIMESTAMPS_NONE;
+             cc->has_result  = true;
++
++            // [nabra] per-token probability (0 = unknown) for callers that compare decodes
++            cc->tokens.clear();
++            for (size_t i = 0; i < generated_ids.size(); ++i) {
++                transcribe_session::TokenEntry entry;
++                entry.id   = generated_ids[i];
++                entry.text = tok.decode(&generated_ids[i], 1);
++                if (i < nabra_tok_logprob.size() && std::isfinite(nabra_tok_logprob[i])) {
++                    entry.p = std::exp(nabra_tok_logprob[i]);
++                }
++                if (i < nabra_tok_frame.size() && std::isfinite(nabra_tok_frame[i])) {
++                    const double frame_ms = 1000.0 * cm->hparams.fe_hop_length * cm->hparams.enc_subsampling_factor /
++                                            std::max(1, cm->hparams.fe_sample_rate);
++                    entry.t0_ms = static_cast<int64_t>(std::llround(nabra_tok_frame[i] * frame_ms));
++                    entry.t1_ms = entry.t0_ms + static_cast<int64_t>(std::llround(frame_ms));
++                }
++                cc->tokens.push_back(std::move(entry));
++            }
+         };
+ 
+         // ----- Autoregressive step passes -----
+@@ -1155,8 +1294,24 @@ transcribe_status run(transcribe_session *          session,
+                 commit_result();
+                 return TRANSCRIBE_ERR_OOM;
+             }
++            // [nabra] attention recording: the layers that hold alignment heads, or every layer
++            // when NABRA_ATTN_DUMP asks for a full dump.
++            const int      nabra_n_layers = std::min<int>(cm->hparams.dec_n_layers, 64);
++            const char *   nabra_dump     = std::getenv("NABRA_ATTN_DUMP");
++            const bool     nabra_dump_all = nabra_dump != nullptr && nabra_dump[0] != '\0';
++            uint64_t       nabra_layer_mask = 0;
++            for (const auto & [layer, head] : g_nabra_cohere_alignment_heads) {
++                if (layer >= 0 && layer < nabra_n_layers && head >= 0 && head < cm->hparams.dec_n_heads) {
++                    nabra_layer_mask |= uint64_t{1} << layer;
++                }
++            }
++            if (nabra_dump_all) {
++                nabra_layer_mask = nabra_n_layers >= 64 ? ~uint64_t{0} : ((uint64_t{1} << nabra_n_layers) - 1);
++            }
++            std::vector<float> nabra_layer_attn;  // one recorded layer: [head][frame]
++            std::vector<float> nabra_peaks;
+             StepBuild sb = build_step_graph(cc->compute_ctx, cm->weights, cm->hparams, cc->kv_cache, max_n_kv, T_enc,
+-                                            cc->decoder_use_flash);
++                                            cc->decoder_use_flash, nabra_layer_mask);
+             if (sb.graph == nullptr || sb.argmax_out == nullptr) {
+                 log_msg(TRANSCRIBE_LOG_LEVEL_ERROR, "cohere run: build_step_graph failed");
+                 commit_result();
+@@ -1181,6 +1336,12 @@ transcribe_status run(transcribe_session *          session,
                  step_mask[p] = mask_zero;
              }
  
@@ -153,14 +375,20 @@ index e7f9e05..114267b 100644
              for (int step = 1; step < max_tokens && next_token != eos_id; ++step) {
                  if (cc->poll_abort()) {
                      commit_result();
-@@ -1225,6 +1276,24 @@ transcribe_status run(transcribe_session *          session,
+@@ -1225,14 +1386,130 @@ transcribe_status run(transcribe_session *          session,
                  ggml_backend_tensor_get(sb.argmax_out, &argmax_id, 0, sizeof(int32_t));
                  next_token = argmax_id;
  
++                // [nabra] a forced transcript overrides the model's own choice; once it is used
++                // up the decode ends there.
++                if (nabra_is_forced) {
++                    next_token = generated_ids.size() < nabra_forced.size() ? nabra_forced[generated_ids.size()] : eos_id;
++                }
++
 +                // [nabra] log-probability of the chosen token: logit - logsumexp(logits)
-+                if (sb.logits_out != nullptr && next_token != eos_id) {
++                if (sb.logits_out != nullptr) {
 +                    const int64_t vocab = sb.logits_out->ne[0];
-+                    if (vocab > 0 && argmax_id >= 0 && argmax_id < vocab) {
++                    if (vocab > 0 && argmax_id >= 0 && argmax_id < vocab && next_token >= 0 && next_token < vocab) {
 +                        nabra_logits.resize(static_cast<size_t>(vocab));
 +                        ggml_backend_tensor_get(sb.logits_out, nabra_logits.data(), 0,
 +                                                static_cast<size_t>(vocab) * sizeof(float));
@@ -169,12 +397,113 @@ index e7f9e05..114267b 100644
 +                        for (int64_t j = 0; j < vocab; ++j) {
 +                            sum += std::exp(static_cast<double>(nabra_logits[j] - top));
 +                        }
-+                        nabra_logprob_sum -= std::log(sum);
-+                        nabra_logprob_n   += 1;
-+                        g_nabra_cohere_avg_logprob = static_cast<float>(nabra_logprob_sum / nabra_logprob_n);
++                        const double chosen = static_cast<double>(nabra_logits[next_token] - top) - std::log(sum);
++                        if (next_token == eos_id) {
++                            g_nabra_cohere_end_logprob = static_cast<float>(chosen);
++                        } else {
++                            nabra_logprob_sum += chosen;
++                            nabra_logprob_n   += 1;
++                            g_nabra_cohere_avg_logprob = static_cast<float>(nabra_logprob_sum / nabra_logprob_n);
++                            nabra_tok_logprob.push_back(static_cast<float>(chosen));
++                        }
 +                    }
++                }
++                if (next_token != eos_id && nabra_tok_logprob.size() < generated_ids.size() + 1) {
++                    nabra_tok_logprob.push_back(std::nanf(""));
++                }
++                // [nabra] where the decoder was listening when it chose this token
++                if (next_token != eos_id && nabra_layer_mask != 0) {
++                    const int    n_heads = cm->hparams.dec_n_heads;
++                    const size_t per     = static_cast<size_t>(T_enc) * static_cast<size_t>(n_heads);
++                    int          n_sel   = 0;
++                    for (int il = 0; il < nabra_n_layers; ++il) {
++                        n_sel += sb.cross_attn_out[il] != nullptr ? 1 : 0;
++                    }
++                    if (nabra_dump_all) {
++                        nabra_attn_stride = static_cast<int>(per) * n_sel;
++                        nabra_tok_attn.resize((generated_ids.size() + 1) * static_cast<size_t>(nabra_attn_stride), 0.0f);
++                    }
++                    nabra_layer_attn.resize(per);
++                    nabra_peaks.clear();
++                    int recorded = 0;
++                    for (int il = 0; il < nabra_n_layers; ++il) {
++                        if (sb.cross_attn_out[il] == nullptr) {
++                            continue;
++                        }
++                        ggml_backend_tensor_get(sb.cross_attn_out[il], nabra_layer_attn.data(), 0, per * sizeof(float));
++                        if (nabra_dump_all) {
++                            std::memcpy(nabra_tok_attn.data() +
++                                            generated_ids.size() * static_cast<size_t>(nabra_attn_stride) +
++                                            static_cast<size_t>(recorded) * per,
++                                        nabra_layer_attn.data(), per * sizeof(float));
++                        }
++                        recorded += 1;
++                        for (const auto & [layer, head] : g_nabra_cohere_alignment_heads) {
++                            if (layer != il || head < 0 || head >= n_heads) {
++                                continue;
++                            }
++                            const float * row  = nabra_layer_attn.data() + static_cast<size_t>(head) * T_enc;
++                            int           best = 0;
++                            for (int t = 1; t < T_enc; ++t) {
++                                if (row[t] > row[best]) {
++                                    best = t;
++                                }
++                            }
++                            nabra_peaks.push_back(static_cast<float>(best));
++                        }
++                    }
++                    float frame = std::nanf("");
++                    if (!nabra_peaks.empty()) {
++                        std::sort(nabra_peaks.begin(), nabra_peaks.end());
++                        const size_t mid = nabra_peaks.size() / 2;
++                        frame = nabra_peaks.size() % 2 == 1 ? nabra_peaks[mid]
++                                                            : 0.5f * (nabra_peaks[mid - 1] + nabra_peaks[mid]);
++                    }
++                    nabra_tok_frame.resize(generated_ids.size(), std::nanf(""));
++                    nabra_tok_frame.push_back(frame);
 +                }
 +
                  if (next_token != eos_id) {
                      generated_ids.push_back(next_token);
-                     if (transcribe::stop_on_repetition(generated_ids, "cohere run")) {
+-                    if (transcribe::stop_on_repetition(generated_ids, "cohere run")) {
++                    if (!nabra_is_forced && transcribe::stop_on_repetition(generated_ids, "cohere run")) {
+                         cc->mark_repetition_stop();
+                         break;
+                     }
+                 }
+             }
++            // [nabra] research aid: NABRA_ATTN_DUMP=<file> writes every weight of every head, which is
++            // how the alignment heads were found (see eval/tools/alignment_heads.py in Nabra).
++            if (nabra_dump_all && nabra_attn_stride > 0) {
++                if (FILE * f = std::fopen(nabra_dump, "wb")) {
++                    int n_sel = 0;
++                    for (int il = 0; il < nabra_n_layers; ++il) {
++                        n_sel += sb.cross_attn_out[il] != nullptr ? 1 : 0;
++                    }
++                    const int32_t header[5] = {0x4E415454, n_sel, cm->hparams.dec_n_heads, T_enc,
++                                               static_cast<int32_t>(generated_ids.size())};
++                    std::fwrite(header, sizeof(int32_t), 5, f);
++                    for (size_t i = 0; i < generated_ids.size(); ++i) {
++                        const int32_t id = generated_ids[i];
++                        const float   lp = i < nabra_tok_logprob.size() ? nabra_tok_logprob[i] : std::nanf("");
++                        std::fwrite(&id, sizeof(int32_t), 1, f);
++                        std::fwrite(&lp, sizeof(float), 1, f);
++                        const std::string piece = cm->tok.decode(&generated_ids[i], 1);
++                        const int32_t     len   = static_cast<int32_t>(piece.size());
++                        std::fwrite(&len, sizeof(int32_t), 1, f);
++                        std::fwrite(piece.data(), 1, piece.size(), f);
++                        const size_t base = i * static_cast<size_t>(nabra_attn_stride);
++                        if (base + static_cast<size_t>(nabra_attn_stride) <= nabra_tok_attn.size()) {
++                            std::fwrite(nabra_tok_attn.data() + base, sizeof(float),
++                                        static_cast<size_t>(nabra_attn_stride), f);
++                        } else {
++                            const std::vector<float> zeros(static_cast<size_t>(nabra_attn_stride), 0.0f);
++                            std::fwrite(zeros.data(), sizeof(float), zeros.size(), f);
++                        }
++                    }
++                    std::fclose(f);
++                }
++            }
+         } else {
+             // ---------- Dynamic-graph step path (CPU) ----------
+             // Reserve scheduler buffers with a worst-case single-token graph

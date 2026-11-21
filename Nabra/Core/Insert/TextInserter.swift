@@ -172,7 +172,10 @@ enum InsertionFormatter {
             let midSentence = before.isLetter || before.isNumber || before == "," || before == "،" || before == ";"
             if midSentence { result = lowercasedStartIfCommonWord(result) }
             let needsSpace = !before.isWhitespace && !before.isNewline && !openers.contains(before)
-            if needsSpace, let first = result.first, !first.isWhitespace, !",.!?;:،؛؟)]}%".contains(first) {
+            if SpokenLists.startsWithList(result), !before.isNewline {
+                // A list dictated after text on the same line starts on a line of its own.
+                result = "\n" + result
+            } else if needsSpace, let first = result.first, !first.isWhitespace, !",.!?;:،؛؟)]}%".contains(first) {
                 result = " " + result
             }
         }
