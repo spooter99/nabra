@@ -126,7 +126,7 @@ private struct HowToCard: View {
         let hotkey = state.settings.hotkey
         Card(padding: 20) {
             HStack(spacing: 22) {
-                KeyCap(symbol: hotkey.keyCapSymbol, label: hotkey.kind == .modifier ? "hold" : nil, size: 60)
+                KeyCap(symbol: hotkey.keyCapSymbol, label: hotkey.kind == .key ? nil : "hold", size: 60)
                 VStack(alignment: .leading, spacing: 9) {
                     gesture("Hold \(hotkey.displayName) and speak", "Release to insert the text where your cursor is.", "hand.tap.fill")
                     if state.settings.handsFreeEnabled {

@@ -10,8 +10,9 @@ PATCH="$ROOT/vendor/patches/transcribe.cpp-v0.4.2-nabra.patch"
 
 if [ ! -d "$SRC" ]; then
   git clone --depth 1 --branch "$TAG" https://github.com/handy-computer/transcribe.cpp.git "$SRC"
-  # Local addition: expose the decoder's confidence and let a second decode reuse the encoder output,
-  # so one clip can be decoded under two language hints cheaply and the results compared.
+  # Local additions, all so one clip can be decoded under two language hints and the results
+  # compared and combined: per-token probability and time in the audio, reuse of the encoder
+  # output by a second decode, and scoring a transcript the caller supplies.
   git -C "$SRC" apply "$PATCH"
 fi
 

@@ -29,12 +29,24 @@ struct NotchView: View {
     private var isVisible: Bool { model.mode != .hidden }
     private var showsLiveText: Bool { model.mode == .listening && !model.liveText.isEmpty }
     private var showsHint: Bool { model.mode == .listening && model.isHandsFree && !showsLiveText && !compact }
+    private var showsWritingText: Bool { model.mode == .writing && !model.writingText.isEmpty }
+    private static let writingWidth: CGFloat = 440
+
+    /// Room for the text Scribe has written so far: up to seven lines, growing as it streams in.
+    private var writingTextHeight: CGFloat {
+        guard showsWritingText else { return 0 }
+        let perLine = max(1, Int((NotchView.writingWidth - 32) / 6.6))
+        let lines = model.writingText.components(separatedBy: "\n").reduce(0) { $0 + max(1, ($1.count + perLine - 1) / perLine) }
+        return CGFloat(min(7, lines)) * 17 + 14
+    }
 
     private func bodyWidth(minimum: CGFloat) -> CGFloat {
         if showsLiveText { return max(minimum, 380) }
+        if model.mode == .writing { return max(minimum, showsWritingText ? NotchView.writingWidth : 96) }
         if model.mode == .notice {
-            let estimated = CGFloat(model.noticeText.count) * 7.2 + 60
-            return max(minimum, min(440, estimated))
+            var estimated = CGFloat(model.noticeText.count) * 7.2 + 60
+            if let action = model.noticeAction { estimated += CGFloat(action.count) * 7 + 30 }
+            return max(minimum, min(480, estimated))
         }
         if compact, model.mode == .listening, model.isHandsFree { return minimum + 18 }
         return minimum
@@ -44,6 +56,7 @@ struct NotchView: View {
         guard isVisible else { return 0 }
         var height = rowHeight
         if showsLiveText { height += 44 }
+        height += writingTextHeight
         if showsHint { height += 16 }
         return height
     }
@@ -85,12 +98,14 @@ struct NotchView: View {
         VStack(spacing: 0) {
             // In the bottom pill the live text sits above the waveform, so the pill grows upward.
             if showsLiveText, compact { liveText }
+            if showsWritingText { writingText }
             Group {
                 switch model.mode {
                 case .listening: listeningRow
                 case .processing: processingRow
                 case .success: successRow
                 case .notice: noticeRow
+                case .writing: writingRow
                 case .hidden: Color.clear
                 }
             }
@@ -121,6 +136,30 @@ struct NotchView: View {
             .transition(.opacity)
     }
 
+    private var writingText: some View {
+        let rightToLeft = TextScript.isRightToLeft(model.writingText)
+        return Text(model.writingText)
+            .font(.system(size: 12.5))
+            .foregroundStyle(.white.opacity(0.9))
+            .lineLimit(7)
+            .truncationMode(.head)
+            .multilineTextAlignment(rightToLeft ? .trailing : .leading)
+            .frame(maxWidth: .infinity, maxHeight: writingTextHeight, alignment: rightToLeft ? .bottomTrailing : .bottomLeading)
+            .padding(.horizontal, 16)
+            .padding(.top, 10)
+            .transition(.opacity)
+    }
+
+    private var writingRow: some View {
+        HStack(spacing: 6) {
+            Image(systemName: "sparkles")
+                .font(.system(size: compact ? 9.5 : 11, weight: .semibold))
+                .foregroundStyle(.white.opacity(0.9))
+            ThinkingDots(size: compact ? 4 : 5)
+        }
+        .transition(.opacity)
+    }
+
     private var listeningRow: some View {
         HStack(spacing: compact ? 6 : 9) {
             if compact {
@@ -129,15 +168,17 @@ struct NotchView: View {
                         .font(.system(size: 8, weight: .bold))
                         .foregroundStyle(.white.opacity(0.75))
                 }
-                WaveformView(meter: model.meter, compact: true)
+                WaveformView(meter: model.meter, compact: true, live: model.isLive)
                     .frame(maxWidth: .infinity)
             } else {
                 RecordingDot(isLocked: model.isHandsFree)
-                WaveformView(meter: model.meter, compact: false)
+                WaveformView(meter: model.meter, compact: false, live: model.isLive)
                     .frame(maxWidth: .infinity)
                 ElapsedTime(since: model.listeningSince)
             }
         }
+        // Dimmed and still until the microphone is really being heard.
+        .opacity(model.isLive ? 1 : 0.4)
         .transition(.opacity)
     }
 
@@ -169,6 +210,17 @@ struct NotchView: View {
                 .font(.system(size: compact ? 12 : 12.5, weight: .medium))
                 .foregroundStyle(.white.opacity(0.95))
                 .lineLimit(1)
+            if let action = model.noticeAction {
+                Text(action)
+                    .font(.system(size: compact ? 11 : 11.5, weight: .semibold))
+                    .foregroundStyle(.black)
+                    .padding(.horizontal, 8)
+                    .padding(.vertical, 2.5)
+                    .background(Capsule().fill(.white.opacity(0.92)))
+                    .contentShape(Capsule())
+                    .onTapGesture { model.onNoticeAction?() }
+                    .help(action)
+            }
         }
         .fixedSize()
         .transition(.opacity)
@@ -301,6 +353,8 @@ private struct ThinkingDots: View {
 private struct WaveformView: View {
     var meter: LevelMeter?
     var compact = false
+    /// False while the microphone is starting: the bars rest instead of moving.
+    var live = true
     @State private var clock = WaveformClock()
 
     private var barWidth: CGFloat { compact ? 2.5 : 3 }
@@ -326,7 +380,7 @@ private struct WaveformView: View {
                     let position = Double(levels.count) - 1 - age
                     var level = WaveformView.sample(levels, at: position)
                     // A faint ripple keeps the display alive in silence.
-                    level = max(level, 0.05 + 0.03 * Float(sin(time * 3.2 + Double(bar) * 0.7)))
+                    level = live ? max(level, 0.05 + 0.03 * Float(sin(time * 3.2 + Double(bar) * 0.7))) : 0.05
                     let tallest = size.height * (compact ? 0.86 : 0.62)
                     let height = barWidth + (tallest - barWidth) * CGFloat(pow(Double(min(1, level)), 0.85))
                     let rect = CGRect(x: originX + CGFloat(bar) * (barWidth + barSpacing),

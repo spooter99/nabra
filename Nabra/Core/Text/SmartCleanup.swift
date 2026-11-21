@@ -50,11 +50,26 @@ final class SmartCleanup {
     ]
     private static let cues: [[String]] = (englishCues + arabicCues).map { words(TextScript.fold($0)) }
 
+    private static let numberWords: Set<String> = [
+        "one", "two", "three", "four", "five", "six", "seven", "eight", "nine", "ten", "eleven", "twelve", "fifteen", "twenty",
+        "thirty", "forty", "fifty", "hundred", "half", "a", "an",
+    ]
+
     /// Positions (as word index ranges) of every correction phrase in `text`.
     private static func cueRanges(in tokens: [String]) -> [Range<Int>] {
         var found: [Range<Int>] = []
         for cue in cues where !cue.isEmpty && tokens.count >= cue.count {
             for start in 0...(tokens.count - cue.count) where Array(tokens[start..<(start + cue.count)]) == cue {
+                let next = start + cue.count < tokens.count ? tokens[start + cue.count] : nil
+                if cue == ["i", "mean"] || cue == ["i", "meant"] {
+                    // "You know what I mean", "that's what I meant", "I mean it": no correction there.
+                    if start > 0, tokens[start - 1] == "what" { continue }
+                    if next == "it" { continue }
+                }
+                if cue == ["make", "that"] {
+                    // "Two coffees, make that three" corrects; "make that change" does not.
+                    guard let next, numberWords.contains(next) || next.allSatisfy(\.isNumber) else { continue }
+                }
                 found.append(start..<(start + cue.count))
             }
         }
@@ -81,6 +96,8 @@ final class SmartCleanup {
         guard !before.isEmpty, !after.isEmpty else { return false }
         if after.count > before.count + 2 { return false }
         if Double(after.count) < Double(before.count) * 0.3 { return false }
+        // Lists and line breaks were dictated too: a rewrite that folds them into one line is not faithful.
+        if lineCount(rewritten) != lineCount(original) { return false }
 
         // No new words (digits are allowed: "three" may become "3").
         let available = Set(before)
@@ -154,6 +171,11 @@ final class SmartCleanup {
 
     private static func words(_ text: String) -> [String] {
         text.split(whereSeparator: { !($0.isLetter || $0.isNumber || $0 == "'") }).map(String.init)
+    }
+
+    /// Lines that hold text.
+    private static func lineCount(_ text: String) -> Int {
+        text.split(whereSeparator: \.isNewline).filter { $0.contains(where: { $0.isLetter || $0.isNumber }) }.count
     }
 
     private static func share(_ counts: (arabic: Int, latin: Int)) -> Double {

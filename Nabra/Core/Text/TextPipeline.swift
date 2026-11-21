@@ -1,18 +1,26 @@
 import Foundation
+import NaturalLanguage
 
-/// Deterministic clean-up applied to every transcript. Fast (well under a millisecond) and predictable.
+/// Deterministic clean-up applied to every transcript. Fast (about a millisecond) and predictable.
 struct TextPipeline {
     struct Options {
         var removeFillers = true
         var voiceCommands = true
-        /// Turn "first… second… third…" into a numbered list.
+        /// Lay out dictated enumerations ("one, … two, …", "first, … second, …") as numbered lists.
         var formatLists = true
+        /// Undo full stops the recogniser wrote where the speaker only paused ("I need. Potatoes").
+        var repairPauses = true
+        /// Break long dictations into paragraphs where the speaker moves on to a new point.
+        var paragraphs = true
         /// (what the recogniser writes, what it should be), longest first.
         var replacements: [(heard: String, phrase: String)] = []
         /// Correct spellings to snap near-misses onto.
         var vocabulary: [String] = []
         /// Returns true when `word` is an ordinary dictionary word. Used to avoid "fixing" real words.
         var isRealWord: (String) -> Bool = { _ in false }
+        /// Returns true when `word`, as it stands in `sentence`, is a name. A name keeps its capital
+        /// when the full stop in front of it is removed.
+        var isName: (_ word: String, _ sentence: String) -> Bool = TextPipeline.looksLikeName
     }
 
     struct Output: Equatable {
@@ -21,21 +29,45 @@ struct TextPipeline {
         var appliedPhrases: [String] = []
     }
 
+    /// Loads what the rarer steps need (the list patterns, the name tagger) on a background thread the
+    /// first time anything is processed, so the first list after launch is as quick as every later one.
+    private static let warmUp: Void = {
+        DispatchQueue.global(qos: .utility).async {
+            _ = SpokenLists.format("One, a. Two, b.")
+            _ = looksLikeName("Potatoes", in: "We need Potatoes today")
+        }
+    }()
+
     static func process(_ raw: String, options: Options) -> Output {
+        _ = warmUp
         var text = raw.replacingOccurrences(of: "\r", with: " ")
         text = stripAnnotations(text)
         text = collapseWhitespace(text)
         if Hallucinations.isHallucination(text) { return Output(text: "") }
 
         if options.voiceCommands { text = applyVoiceCommands(text) }
-        if options.removeFillers {
-            text = removeFillers(text)
-            text = collapseStutter(text)
+        text = Addresses.format(text)
+        if options.removeFillers { text = removeFillers(text) }
+        // Whether a word that is capitalised only because a full stop stood before it may lose the capital.
+        let spoken = text
+        let lowercase: (String, String) -> Bool = { word, sentence in
+            // Written with a capital in the middle of another sentence too: that is how the word is spelled.
+            let elsewhere = "(?<=[\\p{Ll},،;] )" + NSRegularExpression.escapedPattern(for: word) + "(?![\\p{L}\\p{N}'’])"
+            if spoken.range(of: elsewhere, options: .regularExpression) != nil { return false }
+            return mayLowercase(word, in: sentence, isRealWord: options.isRealWord, isName: options.isName)
         }
+        if options.repairPauses { text = repairPauseStops(text, lowercase: lowercase) }
+        // After the pauses are mended, so that "and. And then" does not leave "and and" behind.
+        if options.removeFillers { text = collapseStutter(text) }
         var applied: [String] = []
         text = applyReplacements(text, options.replacements, applied: &applied)
         text = snapVocabulary(text, options.vocabulary, isRealWord: options.isRealWord, applied: &applied)
-        if options.formatLists { text = formatSpokenLists(text) }
+        if options.formatLists {
+            // Numbered when the items were numbered aloud, bullets when the list was only announced.
+            let numbered = SpokenLists.format(text, lowercase: lowercase)
+            text = numbered != text ? numbered : AnnouncedLists.format(text)
+        }
+        if options.paragraphs { text = Paragraphs.format(text) }
         text = tidyPunctuation(text)
         text = capitalizeStarts(text)
         return Output(text: text, appliedPhrases: applied)
@@ -46,14 +78,21 @@ struct TextPipeline {
     private static let annotationWords = [
         "blank_audio", "blank audio", "music", "applause", "laughter", "laughs", "laughing", "silence",
         "inaudible", "noise", "background noise", "sigh", "sighs", "coughs", "cough", "no audio", "no speech",
-        "موسيقى", "تصفيق", "ضحك", "صمت", "موسيقي",
+        "موسيقى", "تصفيق", "ضحك", "صمت", "موسيقي", "ضوضاء",
     ]
 
-    /// Removes non-speech markers such as "[BLANK_AUDIO]", "(music)", "*laughs*" and musical notes.
+    /// Tags the recogniser writes in angle brackets where the speaker hesitated or made a noise.
+    private static let annotationTags = "hesitation|unk|unknown|noise|laugh|laughs|laughter|music|silence|inaudible|"
+        + "unintelligible|cough|breath|sigh|overlap|applause|foreign|no[ _]speech|blank[ _]audio"
+
+    /// Removes non-speech markers such as "[BLANK_AUDIO]", "(music)", "*laughs*", "<hesitation>" and musical notes.
     static func stripAnnotations(_ text: String) -> String {
         var result = text
         let alternatives = annotationWords.map { NSRegularExpression.escapedPattern(for: $0) }.joined(separator: "|")
         result = replace(result, "(?i)[\\[\\(\\*]\\s*(?:\(alternatives))\\s*[\\]\\)\\*]", " ")
+        result = replace(result, "(?i)<\\s*(?:\(annotationTags))\\s*>", " ")
+        // The model marks non-speech it heard with "@@@" and a word ("@@@ضوضاء", noise).
+        result = replace(result, "@@@[\\p{L}_]*", " ")
         result = replace(result, "[♪♫♬♩]+", " ")
         return result
     }
@@ -181,94 +220,122 @@ struct TextPipeline {
         return tokens.map(\.text).joined()
     }
 
-    // MARK: - Spoken lists
+    // MARK: - Pauses written as full stops
 
-    /// Words that announce a list item, with the position they stand for. 0 means "the last one".
-    private static let listMarkers: [(pattern: String, position: Int)] = [
-        ("first(?:ly)?(?:\\s+of\\s+all)?", 1), ("second(?:ly)?", 2), ("third(?:ly)?", 3), ("fourth(?:ly)?", 4),
-        ("fifth(?:ly)?", 5), ("sixth(?:ly)?", 6), ("seventh(?:ly)?", 7), ("eighth(?:ly)?", 8), ("ninth(?:ly)?", 9),
-        ("tenth(?:ly)?", 10),
-        ("number\\s+one", 1), ("number\\s+two", 2), ("number\\s+three", 3), ("number\\s+four", 4),
-        ("number\\s+five", 5), ("number\\s+six", 6), ("number\\s+seven", 7), ("number\\s+eight", 8),
-        ("finally", 0), ("lastly", 0), ("last(?:\\s+one)?", 0),
-        ("[أا]ول[اً]{1,2}", 1), ("ثاني[اً]{1,2}", 2), ("ثالث[اً]{1,2}", 3), ("رابع[اً]{1,2}", 4), ("خامس[اً]{1,2}", 5),
-        ("سادس[اً]{1,2}", 6), ("سابع[اً]{1,2}", 7),
-        ("[أا]ول\\s+(?:شي|شيء|اشي|إشي)", 1), ("[ثت]اني\\s+(?:شي|شيء|اشي|إشي)", 2), ("[ثت]الت?ث?\\s+(?:شي|شيء|اشي|إشي)", 3),
-        ("رابع\\s+(?:شي|شيء|اشي|إشي)", 4), ("خامس\\s+(?:شي|شيء|اشي|إشي)", 5),
-        ("رقم\\s+واحد", 1), ("رقم\\s+(?:اثنين|ثنين|اتنين)", 2), ("رقم\\s+(?:ثلاث[ةه]|تلات[ةه])", 3), ("رقم\\s+[أا]ربع[ةه]", 4),
-        ("[أا]خير[اً]{1,2}", 0), ("[آا]خر\\s+(?:شي|شيء|اشي|إشي)", 0),
+    /// Words a sentence cannot end on. A full stop right after one of them is a pause, not an ending.
+    private static let neverFinalWords: Set<String> = [
+        "a", "an", "the", "and", "or", "but", "because", "my", "your", "our", "their",
+        "i'm", "you're", "we're", "they're", "he's", "she's", "it's", "that's", "there's", "here's",
+        "i'll", "you'll", "we'll", "they'll", "he'll", "she'll", "it'll",
+        "i've", "you've", "we've", "they've", "i'd", "you'd", "we'd", "they'd",
+    ]
+    /// "Plan A." and "option a." do end a sentence.
+    private static let letterLabels: Set<String> = [
+        "plan", "option", "part", "type", "grade", "class", "vitamin", "point", "section", "group", "exhibit", "appendix",
+        "version", "phase", "step", "level", "team", "side", "column", "row", "item", "choice", "answer", "letter",
+    ]
+    private static let joiningWords: Set<String> = ["and", "but", "so", "or", "because", "plus", "yet"]
+    private static let asideWords: Set<String> = ["basically", "actually", "like", "well", "also", "okay", "ok", "now"]
+    /// A clause that is only a subject and "need"/"want" has not said what yet.
+    private static let unfinishedClause = "^(?:(?:and|but|so|then|because|well|okay|ok|also|now)\\s+)*"
+        + "(?:(?:i|we|you|they|he|she|it)\\s+(?:(?:really|just|only|also|still)\\s+)?(?:need|needs|want|wants|would\\s+like)"
+        + "|(?:i|we|you|they|he|she)'d\\s+like)$"
+
+    /// Removes full stops the recogniser wrote where the speaker merely paused. Deliberately narrow,
+    /// because almost any word can end a sentence. It acts only when the words before the stop
+    /// cannot be a finished clause:
+    /// - the stop follows a word no sentence ends on ("the.", "it's.", "and."),
+    /// - the clause is just a subject and "need"/"want" ("I need. Potatoes"),
+    /// - the clause is only joining words ("but basically. It doesn't" becomes "but basically, it doesn't").
+    static func repairPauseStops(_ text: String, lowercase: (String, String) -> Bool) -> String {
+        guard text.contains(". ") else { return text }
+        guard let regex = regex("(?<![\\p{L}\\p{N}'’.])([\\p{L}'’]+)\\.[ \\t]+(?=([\\p{L}'’]+))") else { return text }
+        var edits: [(range: Range<String.Index>, replacement: String)] = []
+        for match in regex.matches(in: text, range: NSRange(text.startIndex..., in: text)) {
+            guard let before = Range(match.range(at: 1), in: text), let after = Range(match.range(at: 2), in: text) else { continue }
+            let stop = before.upperBound..<text.index(after: before.upperBound)
+            let word = text[before].lowercased().replacingOccurrences(of: "’", with: "'")
+
+            // The clause the stop closes: everything since the last punctuation mark.
+            var clauseStart = before.lowerBound
+            while clauseStart > text.startIndex {
+                let previous = text[text.index(before: clauseStart)]
+                if previous.isNewline || ".!?,;:،؛؟…".contains(previous) { break }
+                clauseStart = text.index(before: clauseStart)
+            }
+            let spokenClause = text[clauseStart..<before.upperBound].trimmingCharacters(in: .whitespaces)
+            let clause = spokenClause.lowercased().replacingOccurrences(of: "’", with: "'")
+            let clauseWords = clause.split(separator: " ").map(String.init)
+
+            var replacement: String?
+            if neverFinalWords.contains(word) {
+                // A capital "A." is a label, and so is a lower-case one after "plan" or "option".
+                let isLabel = word == "a" && (text[before] == "A" || clauseWords.count < 2
+                    || letterLabels.contains(clauseWords[clauseWords.count - 2]))
+                if !isLabel { replacement = "" }
+            } else if matches(clause, unfinishedClause) {
+                replacement = ""
+            } else if !clauseWords.isEmpty, clauseWords.contains(where: joiningWords.contains),
+                      clauseWords.allSatisfy({ joiningWords.contains($0) || asideWords.contains($0) || $0 == "then" }) {
+                replacement = asideWords.contains(word) ? "," : ""
+            }
+            guard let replacement else { continue }
+            edits.append((stop, replacement))
+
+            // The next word was capitalised because of the stop.
+            let next = String(text[after])
+            var sentenceEnd = after.upperBound
+            while sentenceEnd < text.endIndex, !text[sentenceEnd].isNewline, !".!?؟".contains(text[sentenceEnd]) {
+                sentenceEnd = text.index(after: sentenceEnd)
+            }
+            let sentence = spokenClause + " " + String(text[after.lowerBound..<sentenceEnd])
+            if let first = next.first, first.isUppercase, lowercase(next, sentence) {
+                edits.append((after.lowerBound..<text.index(after: after.lowerBound), first.lowercased()))
+            }
+        }
+        guard !edits.isEmpty else { return text }
+        var result = text
+        for edit in edits.sorted(by: { $0.range.lowerBound > $1.range.lowerBound }) {
+            result.replaceSubrange(edit.range, with: edit.replacement)
+        }
+        return result
+    }
+
+    /// Words that start sentences all the time and are never names.
+    private static let ordinaryStarters: Set<String> = [
+        "the", "a", "an", "this", "that", "these", "those", "my", "your", "his", "her", "its", "our", "their", "some", "any",
+        "no", "every", "each", "all", "both", "it", "he", "she", "we", "you", "they", "there", "here", "what", "which", "who",
+        "whose", "when", "where", "why", "how", "and", "but", "or", "so", "because", "if", "then", "than", "as", "while",
+        "although", "though", "unless", "until", "since", "to", "of", "in", "on", "at", "for", "with", "from", "by", "about",
+        "into", "over", "under", "after", "before", "between", "through", "during", "without", "within", "is", "are", "was",
+        "were", "be", "been", "being", "am", "do", "does", "did", "have", "has", "had", "will", "would", "can", "could",
+        "should", "might", "must", "shall", "not", "just", "also", "only", "even", "still", "very", "really", "too", "maybe",
+        "please", "like", "basically", "actually", "immediately", "now", "yes", "yeah", "okay", "ok", "well", "let's",
+        "it's", "that's", "there's", "here's", "what's", "don't", "doesn't", "didn't", "can't", "won't", "isn't", "aren't",
+        "wasn't", "weren't", "you're", "we're", "they're", "he's", "she's", "you'll", "we'll", "they'll", "you've", "we've",
+        "they've",
     ]
 
-    /// Rewrites an explicit spoken enumeration as a numbered list:
-    /// "Three things. First, milk. Second, eggs. Third, bread." becomes
-    /// "Three things.\n1. Milk\n2. Eggs\n3. Bread".
-    /// Only fires when the markers come in order starting from "first", so ordinary prose is untouched.
-    static func formatSpokenLists(_ text: String) -> String {
-        struct Hit {
-            var range: Range<String.Index>
-            var position: Int
-        }
-        // A marker counts only at the start of a clause, optionally after "and" / "و".
-        let boundary = "(?:^|(?<=[.!?:;،؛؟\\n])|(?<=,))"
-        var hits: [Hit] = []
-        for marker in listMarkers {
-            // English ordinals double as ordinary adjectives ("first point"), so they only count when
-            // followed by a comma or colon. The Arabic adverb forms are unambiguous.
-            let isArabic = TextScript.containsArabic(marker.pattern)
-            let separator = isArabic ? "[ \\t]*[,:.،-]?[ \\t]+" : "[ \\t]*[,:][ \\t]*"
-            let pattern = "(?i)\(boundary)[ \\t]*(?:and[ \\t]+|و[ \\t]*)?(?:\(marker.pattern))(?![\\p{L}\\p{N}])\(separator)"
-            guard let regex = regex(pattern) else { continue }
-            for match in regex.matches(in: text, range: NSRange(text.startIndex..., in: text)) {
-                guard let range = Range(match.range, in: text) else { continue }
-                hits.append(Hit(range: range, position: marker.position))
-            }
-        }
-        guard hits.count >= 2 else { return text }
-        hits.sort { $0.range.lowerBound < $1.range.lowerBound }
-        // Drop overlapping matches ("أول" inside "أول شي"): keep the longer one.
-        var distinct: [Hit] = []
-        for hit in hits {
-            if let last = distinct.last, hit.range.lowerBound < last.range.upperBound {
-                if text.distance(from: hit.range.lowerBound, to: hit.range.upperBound)
-                    > text.distance(from: last.range.lowerBound, to: last.range.upperBound) {
-                    distinct[distinct.count - 1] = hit
-                }
-            } else {
-                distinct.append(hit)
-            }
-        }
-        // The run must start at 1 and count upward; a "finally" may close it.
-        guard let start = distinct.firstIndex(where: { $0.position == 1 }) else { return text }
-        var run: [Hit] = [distinct[start]]
-        var expected = 2
-        for hit in distinct[(start + 1)...] {
-            if hit.position == expected {
-                run.append(hit)
-                expected += 1
-            } else if hit.position == 0, run.count >= 2 {
-                run.append(hit)
-                break
-            } else {
-                break
-            }
-        }
-        guard run.count >= 2 else { return text }
+    /// Whether `word`, capitalised only because a full stop stood before it, should be written in
+    /// lower case now that the stop is gone. Names, "I" and anything unfamiliar keep their capital.
+    static func mayLowercase(_ word: String, in sentence: String, isRealWord: (String) -> Bool,
+                             isName: (String, String) -> Bool) -> Bool {
+        let plain = word.replacingOccurrences(of: "’", with: "'")
+        guard let first = plain.first, first.isUppercase, first.isASCII else { return false }
+        if plain == "I" || plain.hasPrefix("I'") { return false }
+        // "GitHub", "USA": capitals inside the word are part of how it is written.
+        if plain.dropFirst().contains(where: \.isUppercase) { return false }
+        if ordinaryStarters.contains(plain.lowercased()) { return true }
+        return isRealWord(plain) && !isName(word, sentence)
+    }
 
-        let intro = text[..<run[0].range.lowerBound].trimmingCharacters(in: .whitespacesAndNewlines)
-        var lines: [String] = []
-        for (index, hit) in run.enumerated() {
-            let end = index + 1 < run.count ? run[index + 1].range.lowerBound : text.endIndex
-            var item = String(text[hit.range.upperBound..<end]).trimmingCharacters(in: .whitespacesAndNewlines)
-            // Drop the joining "and" / comma that led into the next marker.
-            item = replace(item, "(?i)[,،;؛]?\\s*(?:and|و)?\\s*$", "")
-            item = item.trimmingCharacters(in: CharacterSet(charactersIn: " ,،;؛"))
-            guard !item.isEmpty else { continue }
-            if TextScript.wordCount(item) <= 6, item.hasSuffix(".") { item.removeLast() }
-            if let first = item.first, first.isLowercase, first.isASCII { item = first.uppercased() + item.dropFirst() }
-            lines.append("\(lines.count + 1). \(item)")
-        }
-        guard lines.count >= 2 else { return text }
-        return (intro.isEmpty ? "" : intro + "\n") + lines.joined(separator: "\n")
+    /// Asks the on-device language tagger whether `word`, as it stands in `sentence`, is a name.
+    static func looksLikeName(_ word: String, in sentence: String) -> Bool {
+        guard let range = sentence.range(of: word) else { return false }
+        let tagger = NLTagger(tagSchemes: [.nameType])
+        tagger.string = sentence
+        let (tag, _) = tagger.tag(at: range.lowerBound, unit: .word, scheme: .nameType)
+        return tag == .personalName || tag == .placeName || tag == .organizationName
     }
 
     private static let arabicPrefixes = ["وال", "بال", "فال", "كال", "لل", "ال", "و", "ف", "ب", "ل", "ك"]
@@ -283,6 +350,12 @@ struct TextPipeline {
         return nil
     }
 
+    private static func startsAddress(_ text: String, at offset: Int) -> Bool {
+        let rest = text.dropFirst(offset).prefix(80)
+        guard let end = rest.firstIndex(where: { $0 == " " || $0 == "\n" }) ?? Optional(rest.endIndex) else { return false }
+        return rest[..<end].contains("@")
+    }
+
     static func tidyPunctuation(_ text: String) -> String {
         var result = text
         result = replace(result, "[ \\t]+([,.!?;:،؛؟])", "$1")          // no space before punctuation
@@ -295,11 +368,17 @@ struct TextPipeline {
         return result.trimmingCharacters(in: .whitespacesAndNewlines)
     }
 
-    /// Capitalises the first Latin letter of the text and of every new line.
+    /// Capitalises the first Latin letter of the text and of every new line, but never the start of
+    /// an email address.
     static func capitalizeStarts(_ text: String) -> String {
         var result = ""
         var atStart = true
-        for character in text {
+        for (offset, character) in text.enumerated() {
+            if atStart, character.isLetter, startsAddress(text, at: offset) {
+                atStart = false
+                result.append(character)
+                continue
+            }
             if atStart, character.isLetter {
                 result += character.isLowercase && character.isASCII ? character.uppercased() : String(character)
                 atStart = false

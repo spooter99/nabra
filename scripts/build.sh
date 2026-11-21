@@ -28,6 +28,7 @@ fi
 
 # --- Speech engine and bundled helper models -------------------------------------------------
 [ -f vendor/engine-dist/lib/libtranscribe.a ] || { echo "Building the speech engine (first build only, a few minutes)..."; scripts/build-engine.sh || exit 1; }
+[ -f vendor/writer-dist/nabra-writer ] || { echo "Building Scribe's writing runtime (first build only, about a minute)..."; scripts/build-writer.sh || exit 1; }
 scripts/fetch-resources.sh || exit 1
 
 # --- App -------------------------------------------------------------------------------------

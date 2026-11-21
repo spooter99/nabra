@@ -27,7 +27,7 @@ struct OnboardingView: View {
 
                 VStack(spacing: 9) {
                     SetupStep(number: 1, title: "Microphone",
-                              detail: "Used only while you hold the dictation key.",
+                              detail: "Records only while you hold the dictation key.",
                               done: state.permissions.microphoneGranted) {
                         Button(state.permissions.microphone == .notDetermined ? "Allow" : "Open Settings") {
                             state.permissions.requestMicrophone()

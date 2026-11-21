@@ -6,12 +6,21 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate {
     private var statusItem: StatusItemController!
     private var mainWindow: NSWindow?
     private let navigation = Navigation()
+    private var robot: Robot?
 
     func applicationDidFinishLaunching(_ notification: Notification) {
         Log.info("Nabra \(Bundle.main.infoDictionary?["CFBundleShortVersionString"] as? String ?? "") launched")
         NSApp.mainMenu = MainMenu.build(target: self)
 
         state = AppState()
+        if AppState.isRobot {
+            // Unattended end-to-end checks: no menu bar item, no window, nothing inserted, and it quits by itself.
+            Robot.configure(state)
+            state.start()
+            robot = Robot(state: state)
+            robot?.run()
+            return
+        }
         statusItem = StatusItemController(state: state, delegate: self)
         state.dictation.onNeedsSetup = { [weak self] in self?.showMainWindow() }
         state.start()
@@ -32,7 +41,15 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate {
     func applicationShouldTerminateAfterLastWindowClosed(_ sender: NSApplication) -> Bool { false }
 
     func applicationWillTerminate(_ notification: Notification) {
-        state?.recorder.cancel()
+        state?.recorder.shutdown()
+        state?.writer.shutdown()
+        state?.transcription.shutdown()
+        UserDefaults.standard.synchronize()
+        // The speech engine's GPU backend tears itself down in C++ static destructors when the process
+        // exits, and aborts there if Metal is still finishing work. Everything that matters is saved
+        // by now (the database commits as it goes), so leave without running them.
+        Log.flushSynchronously()
+        _exit(0)
     }
 
     // MARK: - Windows

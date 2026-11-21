@@ -40,6 +40,9 @@ struct LanguageChoice {
     /// Mute sustained speech that is far quieter than the person dictating. Off by default: the
     /// recogniser already follows the loudest voice, and muting risks dropping a softly spoken sentence.
     var ignoreBackgroundVoices = false
+    /// The language of what was dictated just before ("en" or "ar"), when recent enough to matter.
+    /// Tips the decision only when the audio itself leaves it open.
+    var recentLanguage: String?
 }
 
 /// Owns the speech models and runs all recognition on one serial queue.
@@ -62,15 +65,11 @@ final class TranscriptionService {
 
     @ObservationIgnored fileprivate let queue = DispatchQueue(label: "app.nabra.asr", qos: .userInitiated)
     @ObservationIgnored fileprivate var engine: SpeechEngine?
-    @ObservationIgnored fileprivate var languageIdentifier: LanguageIdentifier?
     @ObservationIgnored fileprivate var voiceDetector: VoiceActivityDetector?
     @ObservationIgnored private var engineModelID: String?
     @ObservationIgnored private var unloadWork: DispatchWorkItem?
-    @ObservationIgnored private var lastLanguage: (tag: String, at: Date)?
     @ObservationIgnored private let abortLock = NSLock()
-
-    /// Speech is called English only above this probability; a wrong "English" call is the costlier mistake.
-    private static let englishThreshold: Float = 0.65
+    @ObservationIgnored private weak var decodingFor: AnyObject?
 
     init() {
         if SpeechModel.all.allSatisfy({ !$0.isInstalled }) { state = .missingModel }
@@ -121,12 +120,22 @@ final class TranscriptionService {
         engineModelID = modelID
     }
 
-    /// Interrupts whatever decode is running. Safe from any thread.
-    func abortCurrentDecode() {
+    /// Interrupts the decode that is running, if it is being done for `owner` (nil: whoever it is for).
+    /// Several dictations can be in flight at once, and cancelling one must not cut another short.
+    /// Safe from any thread.
+    func abortCurrentDecode(for owner: AnyObject? = nil) {
         abortLock.lock()
         let current = engine
+        let mine = owner == nil || decodingFor === owner
         abortLock.unlock()
-        current?.requestAbort()
+        if mine { current?.requestAbort() }
+    }
+
+    /// Records on whose behalf the recogniser is working, for `abortCurrentDecode(for:)`. Call on `queue`.
+    fileprivate func setDecodingOwner(_ owner: AnyObject?) {
+        abortLock.lock()
+        decodingFor = owner
+        abortLock.unlock()
     }
 
     /// Releases the speech model after `minutes` without use. 0 keeps it loaded.
@@ -143,6 +152,16 @@ final class TranscriptionService {
             }
             unloadWork = work
             queue.asyncAfter(deadline: .now() + .seconds(minutes * 60), execute: work)
+        }
+    }
+
+    /// Frees the models before the app quits, so no GPU memory is still in use when the process exits.
+    func shutdown() {
+        queue.sync { [self] in
+            unloadWork?.cancel()
+            unloadWork = nil
+            setEngine(nil, modelID: nil)
+            voiceDetector = nil
         }
     }
 
@@ -170,10 +189,6 @@ final class TranscriptionService {
             voiceDetector = VoiceActivityDetector(modelPath: path)
             if voiceDetector == nil { Log.error("Voice activity model failed to load") }
         }
-        if languageIdentifier == nil, let path = LanguageIdentifier.bundledModelPath {
-            languageIdentifier = LanguageIdentifier(modelPath: path)
-            if languageIdentifier == nil { Log.error("Language model failed to load") }
-        }
     }
 
     private func setState(_ newState: EngineState, modelID: String? = nil) {
@@ -193,9 +208,12 @@ final class TranscriptionService {
     }
 
     /// Transcribes a finished clip (saved recordings, files).
+    /// With `requireSpeech` false the whole clip is decoded even where the voice detector heard no
+    /// speech (a second attempt the user asked for).
     func transcribe(samples: [Float],
                     language mode: LanguageChoice,
                     preferredModelID: String,
+                    requireSpeech: Bool = true,
                     completion: @escaping (TranscriptionResult) -> Void) {
         let started = DispatchTime.now().uptimeNanoseconds
         queue.async { [self] in
@@ -213,7 +231,12 @@ final class TranscriptionService {
                 (probabilities, background) = SpeechActivity.separateBackground(probabilities: probabilities, levels: levels)
             }
             result.speechSeconds = SpeechActivity.speechSeconds(probabilities)
-            if !probabilities.isEmpty, result.speechSeconds < SpeechActivity.minimumSpeechSeconds {
+            if !requireSpeech, result.speechSeconds < SpeechActivity.minimumSpeechSeconds {
+                // Asked to try anyway: decode it all, without trimming to what sounded like speech.
+                probabilities = []
+                background = []
+            }
+            if requireSpeech, !probabilities.isEmpty, result.speechSeconds < SpeechActivity.minimumSpeechSeconds {
                 result.noSpeech = true
             } else {
                 let decoded = decode(samples: samples, range: 0..<samples.count, probabilities: probabilities,
@@ -241,6 +264,7 @@ final class TranscriptionService {
         var notes: [String] = []
         var total = 0.0
         var failed = false
+        var mode = mode
         for piece in SpeechActivity.split(range: range, probabilities: probabilities) {
             let trimmed = SpeechActivity.trim(range: piece, probabilities: probabilities, limit: samples.count)
             guard trimmed.count >= SpeechEngine.sampleRate / 5 else { continue }
@@ -265,18 +289,43 @@ final class TranscriptionService {
             if !note.isEmpty { notes.append(note) }
             if result.aborted { break }
             if result.failed { failed = true; continue }
-            if !result.text.isEmpty { parts.append(result.text) }
+            if !result.text.isEmpty {
+                parts.append(result.text)
+                // What follows in the same breath is most likely in the same language.
+                let label = TranscriptionService.languageLabel(for: result.text)
+                if label == "en" || label == "ar" { mode.recentLanguage = label }
+            }
         }
-        return (parts.joined(separator: " "), total, failed && parts.isEmpty, notes)
+        return (TranscriptionService.join(parts), total, failed && parts.isEmpty, notes)
+    }
+
+    /// Puts separately recognised stretches back together.
+    ///
+    /// The recogniser closes every stretch it is given with a full stop, even when the speaker only
+    /// paused for breath. When the next stretch starts in lower case it heard a continuation, so
+    /// that stop is dropped ("…on GitHub." + "and make it…" becomes "…on GitHub and make it…").
+    static func join(_ pieces: [String]) -> String {
+        var result = ""
+        for piece in pieces where !piece.isEmpty {
+            guard !result.isEmpty else {
+                result = piece
+                continue
+            }
+            if result.hasSuffix("."), !result.hasSuffix(".."), let first = piece.first, first.isASCII, first.isLowercase {
+                result.removeLast()
+            }
+            result += " " + piece
+        }
+        return result
     }
 
     /// Recognises one stretch of speech. Runs on `queue`.
     ///
     /// In Arabic + English mode the audio is decoded under both language hints (sharing one encoder
-    /// pass) and the version the model is more confident in wins. The model transcribes the language
-    /// it actually hears with far higher confidence than it "translates" under the wrong hint, which
-    /// makes this much more reliable than judging the language from the sound alone: an accent, or
-    /// someone else talking nearby, easily fools an acoustic language detector.
+    /// pass) and `LanguageArbiter` works out what was said from the two: which one to build on, and
+    /// whether single words should be taken from the other (an Arabic name in an English sentence).
+    /// Judging the language from the sound alone proved unreliable: an accent, or someone talking
+    /// nearby, easily fools an acoustic language detector.
     private func recognise(_ slice: UnsafeBufferPointer<Float>, engine: SpeechEngine, choice: LanguageChoice,
                            spentMs: inout Double, note: inout String) -> SpeechEngine.Result {
         switch choice.mode {
@@ -288,67 +337,32 @@ final class TranscriptionService {
             break
         }
 
-        // The acoustic guess only decides which hint to try first and breaks ties.
-        var englishLikelihood = languageIdentifier?.englishProbability(slice)
-        if englishLikelihood == nil {
-            if let last = lastLanguage, Date().timeIntervalSince(last.at) < 180 {
-                englishLikelihood = last.tag == "en" ? 0.6 : 0.4
-            } else {
-                englishLikelihood = choice.keyboardIsArabic ? 0.4 : 0.6
-            }
+        var spent = 0.0
+        var passes = 0
+        func run(_ options: SpeechEngine.Options) -> SpeechEngine.Result {
+            let result = engine.transcribe(slice, options: options)
+            spent += result.totalMs
+            passes += 1
+            return result
         }
-        let leansEnglish = (englishLikelihood ?? 0.5) >= 0.5
-        let first = engine.transcribe(slice, options: SpeechEngine.Options(language: leansEnglish ? "en" : "ar"))
-        spentMs += first.totalMs
-        if first.aborted || first.failed { return first }
-        let second = engine.transcribe(slice, options: SpeechEngine.Options(language: leansEnglish ? "ar" : "en",
-                                                                             reuseEncoder: true))
-        spentMs += second.totalMs
-        if second.aborted { return second }
-        if second.failed { return first }
+        defer { spentMs += spent }
 
-        let winner = TranscriptionService.moreTrustworthy(first, second, preferFirstOnTie: true)
-        lastLanguage = (winner.language, Date())
-        note = String(format: "%@ %.2f vs %@ %.2f, sound says %.0f%% English: %@ (%.0f + %.0f ms)",
-                      first.language, first.averageLogProbability, second.language, second.averageLogProbability,
-                      (englishLikelihood ?? 0.5) * 100, winner.language, first.totalMs, second.totalMs)
+        let english = run(SpeechEngine.Options(language: "en", tokenTimes: true))
+        if english.aborted || english.failed { return english }
+        let arabic = run(SpeechEngine.Options(language: "ar", reuseEncoder: true, tokenTimes: true))
+        if arabic.aborted { return arabic }
+        if arabic.failed { return english }
+
+        let outcome = LanguageArbiter.resolve(english: english, arabic: arabic, recentLanguage: choice.recentLanguage,
+                                              keyboardIsArabic: choice.keyboardIsArabic) { ids, language, withTimes in
+            run(SpeechEngine.Options(language: language, reuseEncoder: true, tokenTimes: withTimes, forcedTokens: ids))
+        }
+        note = outcome.note + String(format: " (%d passes, %.0f ms)", passes, spent)
         if ProcessInfo.processInfo.environment["NABRA_DEBUG_TIMING"] != nil {
-            note += String(format: " [enc %.0f/%.0f dec %.0f/%.0f]", first.encodeMs, second.encodeMs, first.decodeMs, second.decodeMs)
-            let letters: (String) -> Int = { $0.unicodeScalars.reduce(0) { $0 + ($1.properties.isAlphabetic ? 1 : 0) } }
-            note += " {\(first.language):\(letters(first.text)):\(first.averageLogProbability):\(first.truncated)"
-                + " \(second.language):\(letters(second.text)):\(second.averageLogProbability):\(second.truncated)}"
+            note += String(format: " [enc %.0f dec %.0f/%.0f]", english.encodeMs, english.decodeMs, arabic.decodeMs)
+            note += " {en: \(english.text)} {ar: \(arabic.text)}"
         }
-        return winner
-    }
-
-    /// Picks between two decodes of the same audio.
-    static func moreTrustworthy(_ a: SpeechEngine.Result, _ b: SpeechEngine.Result,
-                                preferFirstOnTie: Bool) -> SpeechEngine.Result {
-        if a.text.isEmpty != b.text.isEmpty { return a.text.isEmpty ? b : a }
-        // Coverage first. Under the English hint the model can skip an Arabic sentence entirely and be
-        // very sure about the English it did write. If one version says much more and is itself
-        // confident, the other one dropped speech.
-        let lengthA = a.text.unicodeScalars.reduce(0) { $0 + ($1.properties.isAlphabetic ? 1 : 0) }
-        let lengthB = b.text.unicodeScalars.reduce(0) { $0 + ($1.properties.isAlphabetic ? 1 : 0) }
-        let longer = lengthA >= lengthB ? a : b
-        if Double(min(lengthA, lengthB)) < Double(max(lengthA, lengthB)) * 0.7,
-           longer.averageLogProbability > -0.35, !longer.truncated {
-            return longer
-        }
-        // A decode that looped or ran out of room is worth less than its token confidence suggests.
-        let scoreA = a.averageLogProbability - (a.truncated ? 0.5 : 0)
-        let scoreB = b.averageLogProbability - (b.truncated ? 0.5 : 0)
-        if abs(scoreA - scoreB) < 0.02 {
-            // Equally sure. If both wrote the same script they heard the same thing; prefer the hint
-            // that matches what was written. Otherwise go with the acoustic guess (the first decode).
-            let scriptA = languageLabel(for: a.text)
-            let scriptB = languageLabel(for: b.text)
-            if scriptA == scriptB, scriptA == "en" || scriptA == "ar" {
-                return a.language == scriptA ? a : b
-            }
-            return preferFirstOnTie ? a : b
-        }
-        return scoreA > scoreB ? a : b
+        return outcome.result
     }
 
     /// "ar", "en" or "mixed" from the letters in the text.
@@ -567,7 +581,8 @@ final class LiveTranscription {
 
     private let service: TranscriptionService
     private let recorder: SampleSource
-    private let mode: LanguageChoice
+    /// Starts as given; `recentLanguage` then follows what this dictation has committed so far.
+    private var mode: LanguageChoice
     private var timer: DispatchSourceTimer?
 
     // All state below is confined to `service.queue`.
@@ -609,9 +624,9 @@ final class LiveTranscription {
         }
     }
 
-    /// Abandons the session. Any decode in flight is interrupted.
+    /// Abandons the session. A decode in flight for it is interrupted.
     func cancel() {
-        service.abortCurrentDecode()
+        service.abortCurrentDecode(for: self)
         service.queue.async { [self] in
             finished = true
             timer?.cancel()
@@ -648,7 +663,9 @@ final class LiveTranscription {
                         committedNotes += draft.notes
                         result.wasReadyEarly = true
                     } else {
-                        let decoded = service.decode(samples: samples, range: committedEnd..<samples.count,
+                        service.setDecodingOwner(self)
+                        defer { service.setDecodingOwner(nil) }
+                        let decoded = service.decode(samples: samples, range: min(committedEnd, samples.count)..<samples.count,
                                                      probabilities: probabilities, background: background, mode: mode)
                         tail = decoded.text
                         committedNotes += decoded.notes
@@ -656,7 +673,7 @@ final class LiveTranscription {
                         result.failed = decoded.failed && committedText.isEmpty
                     }
                 }
-                result.text = (committedText + [tail]).filter { !$0.isEmpty }.joined(separator: " ")
+                result.text = TranscriptionService.join(committedText + [tail])
                 result.language = TranscriptionService.languageLabel(for: result.text)
                 result.noSpeech = result.text.isEmpty && !result.failed
             }
@@ -672,6 +689,8 @@ final class LiveTranscription {
     private func tick() {
         guard !finished, service.engine != nil else { return }
         let total = recorder.sampleCount
+        // The source only ever grows; anything else means it was replaced under us.
+        guard total >= committedEnd else { return }
         updateDetector(upTo: total, from: nil)
         guard let lastSpeech = SpeechActivity.lastSpeechFrame(probabilities) else { return }
 
@@ -690,7 +709,11 @@ final class LiveTranscription {
             end = max(committedEnd, end / frameSamples * frameSamples)   // keep cuts on the frame grid
             let (text, notes) = decodeLive(range: committedEnd..<end)
             guard !finished else { return }
-            if !text.isEmpty { committedText.append(text) }
+            if !text.isEmpty {
+                committedText.append(text)
+                let label = TranscriptionService.languageLabel(for: text)
+                if label == "en" || label == "ar" { mode.recentLanguage = label }
+            }
             committedNotes += notes
             committedEnd = end
             draft = nil
@@ -715,6 +738,8 @@ final class LiveTranscription {
     private func decodeLive(range: Range<Int>) -> (String, [String]) {
         let audio = recorder.copySamples(in: range)
         guard !audio.isEmpty else { return ("", []) }
+        service.setDecodingOwner(self)
+        defer { service.setDecodingOwner(nil) }
         // Activity is indexed from the start of the recording; shift it to this slice.
         let firstFrame = range.lowerBound / SpeechActivity.frameSamples
         let local = firstFrame < probabilities.count ? Array(probabilities[firstFrame...]) : []
@@ -762,7 +787,7 @@ final class LiveTranscription {
 
     private func publish() {
         guard let onPartial else { return }
-        let text = (committedText + [draft?.text ?? ""]).filter { !$0.isEmpty }.joined(separator: " ")
+        let text = TranscriptionService.join(committedText + [draft?.text ?? ""])
         DispatchQueue.main.async { onPartial(text) }
     }
 }

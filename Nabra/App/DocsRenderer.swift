@@ -20,7 +20,7 @@ enum DocsRenderer {
             configure(model)
             return model
         }
-        let states: [(String, HUDModel)] = [
+        var states: [(String, HUDModel)] = [
             ("indicator-listening", model { $0.mode = .listening }),
             ("indicator-hands-free", model { $0.mode = .listening; $0.isHandsFree = true }),
             ("indicator-processing", model { $0.mode = .processing }),
@@ -30,6 +30,10 @@ enum DocsRenderer {
                 $0.noticeSymbol = "character.book.closed.fill"
             }),
         ]
+        // Not part of the documentation set: the moment before the microphone is heard.
+        if ProcessInfo.processInfo.environment["NABRA_RENDER_STARTING"] != nil {
+            states.append(("indicator-starting", model { $0.mode = .listening; $0.isLive = false; $0.meter = LevelMeter() }))
+        }
         var failed = false
         for (name, state) in states {
             let view = ZStack(alignment: .bottom) {

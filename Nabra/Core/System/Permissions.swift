@@ -1,5 +1,6 @@
 import AppKit
 import AVFoundation
+import Carbon.HIToolbox
 import Observation
 
 /// Tracks the two permissions Nabra needs: the microphone, and Accessibility (to see the dictation
@@ -8,6 +9,9 @@ import Observation
 final class Permissions {
     private(set) var microphone: AVAuthorizationStatus = AVCaptureDevice.authorizationStatus(for: .audio)
     private(set) var accessibility: Bool = AXIsProcessTrusted()
+    /// True while a password field (or an app's "secure keyboard entry") has the keyboard. macOS then
+    /// hides every key press from other apps, so the dictation key cannot be seen until it ends.
+    private(set) var keyboardIsSecured = false
 
     @ObservationIgnored private var timer: Timer?
     /// Called on the main thread when Accessibility access changes.
@@ -31,6 +35,13 @@ final class Permissions {
         if trusted != accessibility {
             accessibility = trusted
             onAccessibilityChange?(trusted)
+        }
+        let secured = IsSecureEventInputEnabled()
+        if secured != keyboardIsSecured {
+            keyboardIsSecured = secured
+            Log.info(secured
+                ? "A password field or secure keyboard entry has the keyboard: the dictation key cannot be seen until it ends"
+                : "The keyboard is visible again: the dictation key works")
         }
     }
 

@@ -8,6 +8,8 @@ struct Hotkey: Codable, Equatable, Hashable {
         case modifier
         /// A regular key, optionally with modifiers, e.g. F5 or ⌃Space.
         case key
+        /// Several modifier keys held together, e.g. ⌃⌥ (`modifiers` says which; either side counts).
+        case chord
     }
 
     var kind: Kind
@@ -25,6 +27,21 @@ struct Hotkey: Codable, Equatable, Hashable {
 
     static let presets: [Hotkey] = [.eitherOption, .rightOption, .leftOption, .function, .rightCommand]
     static let `default` = Hotkey.eitherOption
+    /// Keys offered for Scribe.
+    static let scribePresets: [Hotkey] = [.rightCommand, .rightControl, .rightOption, .leftOption, .function]
+
+    /// True when the two hotkeys would fire on the same press, so they cannot both be used.
+    func overlaps(_ other: Hotkey) -> Bool {
+        switch (kind, other.kind) {
+        case (.modifier, .modifier): return !Set(keyCodes).isDisjoint(with: other.keyCodes)
+        case (.chord, .chord): return modifiers == other.modifiers
+        case (.key, .key): return keyCodes == other.keyCodes && modifiers == other.modifiers
+        default: return false
+        }
+    }
+
+    /// Modifier flags (`NSEvent.ModifierFlags`) of a chord.
+    var chordFlags: NSEvent.ModifierFlags { NSEvent.ModifierFlags(rawValue: modifiers) }
 
     /// Short symbol-style name, e.g. "⌥" or "Right ⌥" or "⌃Space".
     var displayName: String {
@@ -34,7 +51,14 @@ struct Hotkey: Codable, Equatable, Hashable {
             return keyCodes.map { Hotkey.modifierName(for: $0) }.joined(separator: " or ")
         case .key:
             return Hotkey.modifierSymbols(for: modifiers) + Hotkey.keyName(for: keyCodes.first ?? 0)
+        case .chord:
+            return Hotkey.modifierSymbols(for: modifiers)
         }
+    }
+
+    /// Several modifiers held together. `flags` uses `NSEvent.ModifierFlags` (`.function` for Fn).
+    static func chord(_ flags: NSEvent.ModifierFlags) -> Hotkey {
+        Hotkey(kind: .chord, keyCodes: [], modifiers: flags.intersection([.control, .option, .shift, .command, .function]).rawValue)
     }
 
     /// Longer description for settings, e.g. "Either Option key".
@@ -45,6 +69,19 @@ struct Hotkey: Codable, Equatable, Hashable {
         if self == .function { return "Fn (Globe) key" }
         if self == .rightCommand { return "Right Command key" }
         if self == .rightControl { return "Right Control key" }
+        if kind == .chord {
+            let flags = NSEvent.ModifierFlags(rawValue: modifiers)
+            var names: [String] = []
+            if flags.contains(.function) { names.append("Fn") }
+            if flags.contains(.control) { names.append("Control") }
+            if flags.contains(.option) { names.append("Option") }
+            if flags.contains(.shift) { names.append("Shift") }
+            if flags.contains(.command) { names.append("Command") }
+            return names.joined(separator: " + ")
+        }
+        if kind == .modifier, keyCodes.count == 1 {
+            return Hotkey.modifierName(for: keyCodes[0]) + " key"
+        }
         return displayName
     }
 
@@ -60,19 +97,21 @@ struct Hotkey: Codable, Equatable, Hashable {
             case kVK_Function: return "🌐"
             default: return "?"
             }
-        case .key:
+        case .key, .chord:
             return displayName
         }
     }
 
     var isFunctionKey: Bool { kind == .modifier && keyCodes == [UInt16(kVK_Function)] }
 
-    /// How long a modifier must be held alone before recording starts.
+    /// How long a modifier must be held alone before the press counts as a dictation.
     /// Left-hand modifiers are used in shortcuts all day (⌥←, ⌥⌫), so they wait briefly;
-    /// right-hand ones start instantly.
+    /// right-hand ones commit instantly. The microphone is opened at key-down either way
+    /// (see `HotkeyGesture.Action.arm`), so the wait costs no audio.
     static func activationDelay(forModifier keyCode: UInt16) -> TimeInterval {
         switch Int(keyCode) {
-        case kVK_Option, kVK_Command, kVK_Control, kVK_Shift: return 0.16
+        // Right Command and right Control are used in shortcuts too (⌘C, ⌘V with the right hand).
+        case kVK_Option, kVK_Command, kVK_Control, kVK_Shift, kVK_RightCommand, kVK_RightControl: return 0.16
         default: return 0
         }
     }
@@ -109,6 +148,7 @@ struct Hotkey: Codable, Equatable, Hashable {
         if flags.contains(.option) { text += "⌥" }
         if flags.contains(.shift) { text += "⇧" }
         if flags.contains(.command) { text += "⌘" }
+        if flags.contains(.function) { text = "Fn" + text }
         return text
     }
 

@@ -9,20 +9,14 @@ enum AudioDevices {
         var name: String
         var isBuiltIn: Bool
         var isBluetooth: Bool
+        /// Reached over a radio link (Bluetooth, AirPlay, an iPhone used as a microphone). Opening such a
+        /// microphone takes about a second and switches headphones to their call profile, so it is
+        /// never opened speculatively.
+        var isWireless = false
     }
 
     static func inputDevices() -> [Device] {
-        allDeviceIDs().compactMap { id in
-            guard inputChannelCount(id) > 0,
-                  let uid = stringProperty(id, kAudioDevicePropertyDeviceUID),
-                  let name = stringProperty(id, kAudioObjectPropertyName)
-            else { return nil }
-            let transport = transportType(id)
-            return Device(id: id, uid: uid, name: name,
-                          isBuiltIn: transport == kAudioDeviceTransportTypeBuiltIn,
-                          isBluetooth: transport == kAudioDeviceTransportTypeBluetooth
-                              || transport == kAudioDeviceTransportTypeBluetoothLE)
-        }
+        allDeviceIDs().compactMap(describe)
     }
 
     static func defaultInputDevice() -> Device? {
@@ -31,9 +25,35 @@ enum AudioDevices {
         var address = AudioObjectPropertyAddress(mSelector: kAudioHardwarePropertyDefaultInputDevice,
                                                  mScope: kAudioObjectPropertyScopeGlobal,
                                                  mElement: kAudioObjectPropertyElementMain)
-        guard AudioObjectGetPropertyData(AudioObjectID(kAudioObjectSystemObject), &address, 0, nil, &size, &id) == noErr
+        guard AudioObjectGetPropertyData(AudioObjectID(kAudioObjectSystemObject), &address, 0, nil, &size, &id) == noErr,
+              id != 0
         else { return nil }
-        return inputDevices().first { $0.id == id }
+        return describe(id)
+    }
+
+    /// Current sample rate of a device, or 0.
+    static func nominalSampleRate(_ id: AudioDeviceID) -> Double {
+        var address = AudioObjectPropertyAddress(mSelector: kAudioDevicePropertyNominalSampleRate,
+                                                 mScope: kAudioObjectPropertyScopeGlobal,
+                                                 mElement: kAudioObjectPropertyElementMain)
+        var rate: Float64 = 0
+        var size = UInt32(MemoryLayout<Float64>.size)
+        guard AudioObjectGetPropertyData(id, &address, 0, nil, &size, &rate) == noErr else { return 0 }
+        return rate
+    }
+
+    private static func describe(_ id: AudioDeviceID) -> Device? {
+        guard inputChannelCount(id) > 0,
+              let uid = stringProperty(id, kAudioDevicePropertyDeviceUID),
+              let name = stringProperty(id, kAudioObjectPropertyName)
+        else { return nil }
+        let transport = transportType(id)
+        let bluetooth = transport == kAudioDeviceTransportTypeBluetooth || transport == kAudioDeviceTransportTypeBluetoothLE
+        let wireless = bluetooth || transport == kAudioDeviceTransportTypeAirPlay
+            || transport == kAudioDeviceTransportTypeContinuityCaptureWired
+            || transport == kAudioDeviceTransportTypeContinuityCaptureWireless
+        return Device(id: id, uid: uid, name: name, isBuiltIn: transport == kAudioDeviceTransportTypeBuiltIn,
+                      isBluetooth: bluetooth, isWireless: wireless)
     }
 
     static func device(forUID uid: String) -> Device? {

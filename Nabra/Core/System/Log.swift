@@ -25,6 +25,11 @@ enum Log {
         write("ERROR", text)
     }
 
+    /// Waits for every line written so far to reach the file.
+    static func flushSynchronously() {
+        queue.sync {}
+    }
+
     private static func write(_ level: String, _ text: String) {
         let date = Date()
         queue.async {

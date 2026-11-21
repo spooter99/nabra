@@ -5,9 +5,11 @@ import Foundation
 ///   Nabra --transcribe <audio file> --model <path> [options]
 enum CommandLineTool {
     static func shouldRun(arguments: [String]) -> Bool {
-        arguments.contains("--eval") || arguments.contains("--transcribe") || arguments.contains("--simulate")
+        arguments.contains("--format")
+            || arguments.contains("--eval") || arguments.contains("--transcribe") || arguments.contains("--simulate")
             || arguments.contains("--seed-demo") || arguments.contains("--selftest") || arguments.contains("--polish")
             || arguments.contains("--download-model") || arguments.contains("--render-indicator")
+            || arguments.contains("--probe") || arguments.contains("--capture-bench") || arguments.contains("--scribe")
     }
 
     private struct Arguments {
@@ -48,6 +50,13 @@ enum CommandLineTool {
         if let directory = arguments.string("--render-indicator") {
             return MainActor.assumeIsolated { DocsRenderer.renderIndicator(to: directory) }
         }
+        if let text = arguments.string("--format") { return format(text) }
+        if let text = arguments.string("--scribe") { return scribe(text, app: arguments.string("--app")) }
+        if let report = arguments.string("--capture-bench") {
+            return CaptureBench.run(reportPath: report, runs: arguments.int("--runs") ?? 4,
+                                    gap: Double(arguments.string("--gap") ?? "5") ?? 5,
+                                    paths: (arguments.string("--paths") ?? "direct,engine").split(separator: ",").map(String.init))
+        }
         if let text = arguments.string("--polish") { return polish(text, force: arguments.has("--always")) }
         if arguments.has("--selftest") { return SelfTest.run() }
         guard let modelPath = arguments.string("--model") else {
@@ -67,7 +76,12 @@ enum CommandLineTool {
 
         var options = SpeechEngine.Options()
         if let language = arguments.string("--lang") { options.language = language }
+        if let dump = arguments.string("--attn-dump") { setenv("NABRA_ATTN_DUMP", dump, 1) }
+        if arguments.has("--tokens") || arguments.has("--attn-dump") { options.tokenTimes = true }
 
+        if let file = arguments.string("--probe") {
+            return probe(file: file, engine: engine, weave: arguments.string("--weave"))
+        }
         if let file = arguments.string("--transcribe") {
             return transcribe(file: file, engine: engine, options: options)
         }
@@ -85,11 +99,66 @@ enum CommandLineTool {
             fputs(String(format: "%.1fs audio, %.0f ms (encode %.0f, decode %.0f), logprob %.2f%@\n",
                          result.audioSeconds, result.totalMs, result.encodeMs, result.decodeMs,
                          result.averageLogProbability, result.truncated ? " TRUNCATED" : ""), stderr)
+            if CommandLine.arguments.contains("--tokens") {
+                for token in result.tokens {
+                    fputs(String(format: "  %6.2fs  %6.2f  %@\n", token.time, token.logProbability,
+                                 token.text.replacingOccurrences(of: " ", with: "▁")), stderr)
+                }
+            }
             return 0
         } catch {
             fputs("\(error.localizedDescription)\n", stderr)
             return 1
         }
+    }
+
+    /// Shows what the language decision has to work with for one clip: both decodes with every
+    /// piece's time and log-probability, and each transcript scored under the other hint.
+    /// `--weave "E:0-4,A:9-13"` also scores a transcript assembled from piece ranges of the two.
+    ///   Nabra --probe <audio file> --model <path> [--weave <ranges>]
+    private static func probe(file: String, engine: SpeechEngine, weave: String?) -> Int32 {
+        guard let samples = try? AudioFileIO.loadSamples(from: URL(fileURLWithPath: file)) else { return 1 }
+        let english = engine.transcribe(samples, options: .init(language: "en", tokenTimes: true))
+        let arabic = engine.transcribe(samples, options: .init(language: "ar", reuseEncoder: true, tokenTimes: true))
+        func show(_ name: String, _ result: SpeechEngine.Result) {
+            print(String(format: "%@ avg %.2f end %.2f (%.0f ms): %@", name, result.averageLogProbability,
+                         result.endLogProbability, result.totalMs, result.text))
+            var line = "   "
+            for (index, token) in result.tokens.enumerated() {
+                line += String(format: " %d:%@(%.2f@%.2f)", index, token.text.replacingOccurrences(of: " ", with: "▁"),
+                               token.logProbability, token.time)
+            }
+            print(line)
+        }
+        show("E|en", english)
+        show("A|ar", arabic)
+        func score(_ name: String, _ ids: [Int32], under language: String) {
+            let result = engine.transcribe(samples, options: .init(language: language, reuseEncoder: true, forcedTokens: ids))
+            let worst = result.tokens.map(\.logProbability).filter { $0.isFinite }.min() ?? .nan
+            print(String(format: "%@ avg %.2f worst %.2f end %.2f (%.0f ms): %@", name, result.averageLogProbability,
+                         worst, result.endLogProbability, result.totalMs, result.text))
+            var line = "   "
+            for token in result.tokens {
+                line += String(format: " %@(%.2f)", token.text.replacingOccurrences(of: " ", with: "▁"), token.logProbability)
+            }
+            print(line)
+        }
+        score("E|ar", english.tokens.map(\.id), under: "ar")
+        score("A|en", arabic.tokens.map(\.id), under: "en")
+        if let weave {
+            var ids: [Int32] = []
+            for part in weave.split(separator: ",") {
+                let pieces = part.split(separator: ":")
+                guard pieces.count == 2 else { continue }
+                let bounds = pieces[1].split(separator: "-").compactMap { Int($0) }
+                guard bounds.count == 2 else { continue }
+                let source = pieces[0] == "E" ? english.tokens : arabic.tokens
+                ids += source[max(0, bounds[0])...min(source.count - 1, bounds[1])].map(\.id)
+            }
+            score("W|ar", ids, under: "ar")
+            score("W|en", ids, under: "en")
+        }
+        return 0
     }
 
     private static func evaluate(manifest: String,
@@ -282,7 +351,8 @@ enum CommandLineTool {
             guard let samples = try? AudioFileIO.loadSamples(from: baseURL.appendingPathComponent(path)) else { continue }
             var finished: TranscriptionResult?
             let choice = LanguageChoice(mode: mode, ignoreBackgroundVoices: arguments.has("--mute-background"))
-            service.transcribe(samples: samples, language: choice, preferredModelID: modelID) { finished = $0 }
+            service.transcribe(samples: samples, language: choice, preferredModelID: modelID,
+                               requireSpeech: !arguments.has("--decode-all")) { finished = $0 }
             while finished == nil { RunLoop.main.run(mode: .default, before: Date(timeIntervalSinceNow: 0.002)) }
             guard let result = finished else { continue }
             let record: [String: Any] = [
@@ -300,6 +370,54 @@ enum CommandLineTool {
         } else {
             print(output, terminator: "")
         }
+        return 0
+    }
+
+    // MARK: - Scribe check
+
+    /// Runs one transcript through Scribe exactly as the app would, printing the text as it streams.
+    /// Uses the model in Settings, or the file in NABRA_WRITER_MODEL.
+    private static func scribe(_ text: String, app: String?) -> Int32 {
+        let writer = LlamaServerWriter()
+        guard writer.isInstalled else {
+            fputs("Scribe is not installed (helper or model missing)\n", stderr)
+            return 1
+        }
+        var request = WritingRequest(transcript: text)
+        request.appName = app
+        let job = ScribeRouter.job(for: text)
+        fputs("job: \(job)\n", stderr)
+        let started = Date()
+        var firstAt: Date?
+        var done = false
+        var output: String?
+        writer.write(request, job: job, onText: { partial in
+            if firstAt == nil { firstAt = Date() }
+            _ = partial
+        }, completion: { final in
+            output = final
+            done = true
+        })
+        while !done { RunLoop.main.run(mode: .default, before: Date(timeIntervalSinceNow: 0.01)) }
+        if case .compose = job, let written = output { output = ScribeRouter.tidyComposed(written) }
+        if job == .polish, let written = output, let problem = ScribeRouter.problem(polished: written, from: text) {
+            fputs("check: would keep the words as said, the rewrite \(problem)\n", stderr)
+        }
+        print(output ?? "(nothing)")
+        fputs(String(format: "first text after %.0f ms, done after %.0f ms\n",
+                     (firstAt ?? Date()).timeIntervalSince(started) * 1000, Date().timeIntervalSince(started) * 1000), stderr)
+        writer.shutdown()
+        return output == nil ? 1 : 0
+    }
+
+    // MARK: - Text layout check
+
+    /// Runs one transcript through the clean-up that every dictation gets (lists, pauses, commands)
+    /// and prints what would be inserted. `\n` in the argument stands for a line break.
+    private static func format(_ text: String) -> Int32 {
+        var options = TextPipeline.Options()
+        options.isRealWord = SpellingOracle.isRealWord
+        print(TextPipeline.process(text.replacingOccurrences(of: "\\n", with: "\n"), options: options).text)
         return 0
     }
 

@@ -6,6 +6,9 @@ Nabra.xcodeproj/
 # The speech engine is cloned and built by scripts/build-engine.sh
 vendor/transcribe.cpp/
 vendor/engine-dist/
+# Scribe's writing runtime is cloned and built by scripts/build-writer.sh
+vendor/llama.cpp/
+vendor/writer-dist/
 
 # Helper models are downloaded by scripts/fetch-resources.sh
 Nabra/Resources/*.gguf
